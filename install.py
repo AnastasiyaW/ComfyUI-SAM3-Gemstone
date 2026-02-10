@@ -5,9 +5,9 @@ import sys
 import os
 
 
-def pip_install(*packages):
+def pip_install(*args):
     subprocess.check_call(
-        [sys.executable, "-m", "pip", "install", *packages],
+        [sys.executable, "-m", "pip", "install", *args],
         stdout=subprocess.DEVNULL,
     )
 
@@ -16,8 +16,8 @@ def main():
     try:
         import sam3  # noqa: F401
     except ImportError:
-        print("[SAM3-Gemstone] Installing sam3 package...")
-        pip_install("sam3>=0.1.2")
+        print("[SAM3-Gemstone] Installing sam3 package (--no-deps to protect existing torch/CUDA)...")
+        pip_install("--no-deps", "sam3>=0.1.2")
 
     try:
         import huggingface_hub  # noqa: F401

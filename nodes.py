@@ -1,8 +1,20 @@
+import os
 import torch
 import numpy as np
 from PIL import Image
 
 import comfy.model_management as mm
+import folder_paths
+
+# ---------------------------------------------------------------------------
+# Model directory — ComfyUI/models/sam3/
+# ---------------------------------------------------------------------------
+SAM3_MODEL_DIR = os.path.join(folder_paths.models_dir, "sam3")
+os.makedirs(SAM3_MODEL_DIR, exist_ok=True)
+
+SAM3_HF_REPO = "facebook/sam3"
+SAM3_CHECKPOINT = "sam3.pt"        # 3.45 GB — единственный чекпоинт (0.9B, максимальное качество)
+SAM3_CONFIG = "config.json"
 
 # ---------------------------------------------------------------------------
 # Gemstone-specific text prompts ranked by expected segmentation quality.
@@ -58,12 +70,21 @@ def _get_dtype(precision: str) -> torch.dtype:
 #  1.  LOADER NODE
 # ============================================================================
 class SAM3GemstoneModelLoader:
-    """Load SAM 3 model with H100-optimised settings."""
+    """Load SAM 3 model (0.9B params — maximum quality, single checkpoint).
+
+    Auto-downloads sam3.pt (3.45 GB) from HuggingFace on first run.
+    HF token is required because facebook/sam3 is a gated repo.
+    """
 
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
+                "hf_token": ("STRING", {
+                    "default": "",
+                    "multiline": False,
+                    "placeholder": "hf_... (required for gated facebook/sam3)",
+                }),
                 "precision": (["bf16", "fp16", "fp32"], {"default": "bf16"}),
                 "compile_model": ("BOOLEAN", {"default": True}),
             },
@@ -74,7 +95,54 @@ class SAM3GemstoneModelLoader:
     FUNCTION = "load"
     CATEGORY = "SAM3-Gemstone"
 
-    def load(self, precision: str, compile_model: bool):
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _ensure_checkpoint(hf_token: str) -> str:
+        """Return local path to sam3.pt, downloading if missing."""
+        ckpt_path = os.path.join(SAM3_MODEL_DIR, SAM3_CHECKPOINT)
+        cfg_path = os.path.join(SAM3_MODEL_DIR, SAM3_CONFIG)
+
+        if os.path.isfile(ckpt_path) and os.path.isfile(cfg_path):
+            print(f"[SAM3-Gemstone] Checkpoint found: {ckpt_path}")
+            return ckpt_path
+
+        from huggingface_hub import hf_hub_download
+
+        token = hf_token.strip() or None
+
+        print(f"[SAM3-Gemstone] Downloading {SAM3_CHECKPOINT} from {SAM3_HF_REPO} ...")
+        hf_hub_download(
+            repo_id=SAM3_HF_REPO,
+            filename=SAM3_CHECKPOINT,
+            local_dir=SAM3_MODEL_DIR,
+            token=token,
+        )
+        print(f"[SAM3-Gemstone] Downloading {SAM3_CONFIG} from {SAM3_HF_REPO} ...")
+        hf_hub_download(
+            repo_id=SAM3_HF_REPO,
+            filename=SAM3_CONFIG,
+            local_dir=SAM3_MODEL_DIR,
+            token=token,
+        )
+        # tokenizer files needed by SAM 3 text encoder
+        for fname in ("tokenizer.json", "tokenizer_config.json",
+                      "vocab.json", "merges.txt", "special_tokens_map.json",
+                      "processor_config.json"):
+            target = os.path.join(SAM3_MODEL_DIR, fname)
+            if not os.path.isfile(target):
+                print(f"[SAM3-Gemstone] Downloading {fname} ...")
+                hf_hub_download(
+                    repo_id=SAM3_HF_REPO,
+                    filename=fname,
+                    local_dir=SAM3_MODEL_DIR,
+                    token=token,
+                )
+
+        print(f"[SAM3-Gemstone] All files downloaded to {SAM3_MODEL_DIR}")
+        return ckpt_path
+
+    # ------------------------------------------------------------------
+    def load(self, hf_token: str, precision: str, compile_model: bool):
         device = mm.get_torch_device()
         dtype = _get_dtype(precision)
 
@@ -85,16 +153,22 @@ class SAM3GemstoneModelLoader:
         # ---- H100 / Ampere+ fast-math ----------------------------------
         if device.type == "cuda":
             prop = torch.cuda.get_device_properties(device)
-            if prop.major >= 8:
+            if prop.major >= 8:  # Ampere (A100) = 8, Hopper (H100) = 9
                 torch.backends.cuda.matmul.allow_tf32 = True
                 torch.backends.cudnn.allow_tf32 = True
                 torch.backends.cudnn.benchmark = True
 
-        # ---- Build the image model (downloads weights on first run) -----
+        # ---- Auto-download checkpoint ----------------------------------
+        ckpt_path = self._ensure_checkpoint(hf_token)
+
+        # ---- Build the image model from local checkpoint ---------------
         from sam3.model_builder import build_sam3_image_model
 
         compile_mode = "max-autotune" if compile_model else None
-        model = build_sam3_image_model(compile_mode=compile_mode)
+        model = build_sam3_image_model(
+            checkpoint_path=ckpt_path,
+            compile_mode=compile_mode,
+        )
 
         # Move to device & dtype
         model = model.to(device=device, dtype=dtype)

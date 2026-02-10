@@ -1,0 +1,13 @@
+[project]
+name = "comfyui-sam3-gemstone"
+description = "SAM 3 (Segment Anything Model 3) node for ComfyUI optimized for gemstone segmentation on H100 GPUs"
+version = "1.0.0"
+license = "MIT"
+requires-python = ">=3.12"
+
+[project.urls]
+Repository = "https://github.com/BOBsonic459/ComfyUI-SAM3-Gemstone"
+
+[tool.comfy]
+PublisherId = "bobsonic459"
+DisplayName = "SAM3 Gemstone Segmentation"

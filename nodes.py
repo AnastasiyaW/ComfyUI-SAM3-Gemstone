@@ -787,10 +787,8 @@ class ZIMRefineMask:
     If ZIM can't find the object → fallback to original mask edges."""
 
     # Presets: chain_mode=True → tiny min_object_area for chain links
-    PRESET_NORMAL = {"min_object_area": 50, "crop_padding": 30, "large_object_pct": 5.0,
-                     "band_outer": 10, "zim_min_coverage": 0.10}
-    PRESET_CHAIN = {"min_object_area": 5, "crop_padding": 15, "large_object_pct": 3.0,
-                    "band_outer": 6, "zim_min_coverage": 0.05}
+    PRESET_NORMAL = {"min_object_area": 50, "crop_padding": 30, "large_object_pct": 5.0}
+    PRESET_CHAIN = {"min_object_area": 5, "crop_padding": 15, "large_object_pct": 3.0}
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -864,12 +862,10 @@ class ZIMRefineMask:
         min_object_area = p["min_object_area"]
         crop_padding = p["crop_padding"]
         large_object_pct = p["large_object_pct"]
-        band_outer = p["band_outer"]
-        zim_min_coverage = p["zim_min_coverage"]
 
         logger.info("=" * 60)
-        logger.info("[ZIM-Refine] START  B=%d  H=%d  W=%d  chain_mode=%s  min_area=%d  band_outer=%d",
-                    B, H, W, chain_mode, min_object_area, band_outer)
+        logger.info("[ZIM-Refine] START  B=%d  H=%d  W=%d  chain_mode=%s  min_area=%d",
+                    B, H, W, chain_mode, min_object_area)
 
         predictor = _load_zim_model()
 
@@ -919,13 +915,11 @@ class ZIMRefineMask:
                         len(small_objects), len(large_objects), skipped_tiny, min_object_area)
 
             # ---------------------------------------------------------------
-            # Strategy: ALWAYS crop around each object for ZIM.
-            # ZIM internally resizes to 1024x1024 — on a 4000px image a
-            # 10px gemstone becomes ~2.5px, invisible. By cropping around
-            # the bbox+padding, even tiny objects fill enough of ZIM's
-            # input resolution for pixel-perfect alpha edges.
-            # Mask-derived point prompts (centroid=fg, box corners=bg)
-            # guide ZIM to the exact object.
+            # Strategy: crop around each object, let ZIM form the mask.
+            # ZIM gets: image crop + fg/bg point prompts + bbox.
+            # ZIM returns: soft alpha mask (sigmoid 0..1) with proper edges.
+            # We take ZIM's alpha AS IS in the crop region — no constraining
+            # to the original mask shape. ZIM IS the mask generator here.
             # ---------------------------------------------------------------
             unified_alpha = np.zeros((H, W), dtype=np.float32)
 
@@ -965,53 +959,31 @@ class ZIMRefineMask:
                         masks_out, iou_scores, _ = predictor.predict(
                             box=local_box, multimask_output=True)
 
-                    # Select best mask by predicted IoU — use raw ZIM sigmoid
+                    # Select best mask by predicted IoU
                     best_idx = int(np.argmax(iou_scores))
                     crop_alpha = masks_out[best_idx].astype(np.float32)
 
-                    if idx < 3:
+                    if idx < 5:
                         logger.info("  [ZIM] obj %d: crop=%dx%d, box=[%d,%d,%d,%d], "
-                                    "iou_scores=%s, alpha range=[%.3f, %.3f], alpha_mean=%.3f",
+                                    "best_iou=%.3f, alpha [%.3f..%.3f] mean=%.3f",
                                     label_id, crop.shape[1], crop.shape[0],
                                     int(local_box[0]), int(local_box[1]),
                                     int(local_box[2]), int(local_box[3]),
-                                    [f"{s:.3f}" for s in iou_scores],
+                                    float(iou_scores[best_idx]),
                                     float(crop_alpha.min()), float(crop_alpha.max()),
                                     float(crop_alpha.mean()))
 
-                    full_zim_alpha = np.zeros((H, W), dtype=np.float32)
-                    full_zim_alpha[cy1:cy2, cx1:cx2] = crop_alpha
-
-                    # Check if ZIM found something meaningful in this object's area
-                    obj_mask_sum = max(obj_mask_u8.sum(), 1)
-                    zim_in_obj = (full_zim_alpha * obj_mask_u8).sum()
-                    obj_coverage = zim_in_obj / obj_mask_sum
-
-                    if idx < 3:
-                        logger.info("  [ZIM] obj %d: zim_in_obj=%.1f, obj_mask_sum=%d, "
-                                    "coverage=%.3f (min=%.2f)",
-                                    label_id, float(zim_in_obj), int(obj_mask_sum),
-                                    float(obj_coverage), zim_min_coverage)
-
-                    if obj_coverage < zim_min_coverage:
-                        zim_fallback += 1
-                        unified_alpha = np.maximum(unified_alpha, obj_mask_u8.astype(np.float32))
-                        if idx < 10:
-                            logger.info("  [ZIM] obj %d: coverage %.3f < %.2f → FALLBACK",
-                                        label_id, float(obj_coverage), zim_min_coverage)
-                        continue
-
-                    # Use ZIM alpha directly — constrain to dilated object zone
-                    kern = cv2.getStructuringElement(
-                        cv2.MORPH_ELLIPSE, (band_outer * 2 + 1, band_outer * 2 + 1))
-                    obj_zone = cv2.dilate(obj_mask_u8, kern, iterations=1).astype(np.float32)
-                    unified_alpha = np.maximum(unified_alpha, full_zim_alpha * obj_zone)
+                    # ZIM forms the mask — take it AS IS in the crop region.
+                    # No constraining to original mask shape.
+                    # Just merge into unified alpha (max blend).
+                    unified_alpha[cy1:cy2, cx1:cx2] = np.maximum(
+                        unified_alpha[cy1:cy2, cx1:cx2], crop_alpha)
                     zim_refined += 1
 
                     if (idx + 1) % 50 == 0:
                         logger.info("[ZIM-Refine] %d/%d done", idx + 1, len(all_objects))
 
-                logger.info("[ZIM-Refine] %d objects: %.2fs", len(all_objects), time.time() - t_refine)
+                logger.info("[ZIM-Refine] %d objects in %.2fs", len(all_objects), time.time() - t_refine)
 
             # Tiny objects that were skipped — add their original mask
             for label_id in range(1, num_labels):

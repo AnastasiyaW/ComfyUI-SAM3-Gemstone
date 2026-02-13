@@ -397,14 +397,15 @@ class SAM3Gemstone:
 
     # =====================================================================
     #  ZIM refinement — refine edges of surviving detections
-    #  Strategy: SAM3 logit = base (fills object), ZIM replaces only edge band
+    #  Strategy: Use ZIM alpha DIRECTLY per detection bbox.
+    #  ZIM produces pixel-perfect edges natively. Constrain to dilated
+    #  SAM3 zone to prevent bleeding into neighbor objects.
     # =====================================================================
     def _refine_with_zim(self, zim_predictor, np_img, surviving, all_boxes, all_logits, H, W):
         t0 = time.time()
         image_area = H * W
         refined_logits = {}
 
-        BAND_INNER = 5
         BAND_OUTER = 10
         ZIM_MIN_COVERAGE = 0.10
 
@@ -445,10 +446,11 @@ class SAM3Gemstone:
                     logger.debug("  [ZIM] det %d: coverage %.1f%% → FALLBACK to SAM3", gi, obj_coverage * 100)
                     continue
 
-                edge_band = _build_edge_band(sam3_np, BAND_INNER, BAND_OUTER)
-                base = sam3_np.astype(np.float32)
-                blended = base * (1.0 - edge_band) + zim_alpha * edge_band
-                refined_logits[gi] = torch.from_numpy(np.maximum(base, blended).clip(0, 1))
+                # Use ZIM alpha directly — constrain to dilated SAM3 zone
+                kern = cv2.getStructuringElement(
+                    cv2.MORPH_ELLIPSE, (BAND_OUTER * 2 + 1, BAND_OUTER * 2 + 1))
+                obj_zone = cv2.dilate(sam3_np, kern, iterations=1).astype(np.float32)
+                refined_logits[gi] = torch.from_numpy((zim_alpha * obj_zone).clip(0, 1))
 
                 if (idx + 1) % 50 == 0:
                     logger.info("[ZIM] Small: %d/%d done", idx + 1, len(small_indices))
@@ -490,10 +492,11 @@ class SAM3Gemstone:
                     logger.debug("  [ZIM] large det %d: coverage %.1f%% → FALLBACK", gi, obj_coverage * 100)
                     continue
 
-                edge_band = _build_edge_band(sam3_np, BAND_INNER, BAND_OUTER)
-                base = sam3_np.astype(np.float32)
-                blended = base * (1.0 - edge_band) + full_zim * edge_band
-                refined_logits[gi] = torch.from_numpy(np.maximum(base, blended).clip(0, 1))
+                # Use ZIM alpha directly — constrain to dilated SAM3 zone
+                kern = cv2.getStructuringElement(
+                    cv2.MORPH_ELLIPSE, (BAND_OUTER * 2 + 1, BAND_OUTER * 2 + 1))
+                obj_zone = cv2.dilate(sam3_np, kern, iterations=1).astype(np.float32)
+                refined_logits[gi] = torch.from_numpy((full_zim * obj_zone).clip(0, 1))
 
             logger.info("[ZIM] %d large objects: %.2fs", len(large_indices), time.time() - t_large)
 

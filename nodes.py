@@ -289,12 +289,17 @@ class SAM3Gemstone:
         return pipe
 
     # =====================================================================
-    #  ZIM refinement — process surviving detections
+    #  ZIM refinement — refine edges of surviving detections
+    #  Strategy: SAM3 logit = base (fills object), ZIM replaces only edge band
     # =====================================================================
     def _refine_with_zim(self, zim_predictor, np_img, surviving, all_boxes, all_logits, H, W):
         t0 = time.time()
         image_area = H * W
         refined_logits = {}
+
+        BAND_INNER = 5
+        BAND_OUTER = 10
+        ZIM_MIN_COVERAGE = 0.10
 
         small_indices = []
         large_indices = []
@@ -320,7 +325,34 @@ class SAM3Gemstone:
                 bbox_np = np.array([box[0].item(), box[1].item(),
                                     box[2].item(), box[3].item()], dtype=np.float32)
                 masks, scores, _ = zim_predictor.predict(box=bbox_np, multimask_output=False)
-                refined_logits[gi] = torch.from_numpy(masks[0].astype(np.float32))
+                zim_alpha = masks[0].astype(np.float32)
+
+                # Get SAM3 mask as base
+                sam3_mask = all_logits[gi]
+                if isinstance(sam3_mask, torch.Tensor):
+                    sam3_np = (sam3_mask.numpy() > 0.5).astype(np.uint8)
+                else:
+                    sam3_np = (sam3_mask > 0.5).astype(np.uint8) if isinstance(sam3_mask, np.ndarray) else np.zeros((H, W), dtype=np.uint8)
+
+                # Check ZIM coverage
+                obj_coverage = (zim_alpha * sam3_np).sum() / max(sam3_np.sum(), 1)
+                if obj_coverage < ZIM_MIN_COVERAGE:
+                    logger.debug("  [ZIM] det %d: coverage %.1f%% → FALLBACK to SAM3", gi, obj_coverage * 100)
+                    continue
+
+                # Build edge band: smooth transition around SAM3 mask contour
+                kern_outer = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (BAND_OUTER * 2 + 1, BAND_OUTER * 2 + 1))
+                kern_inner = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (BAND_INNER * 2 + 1, BAND_INNER * 2 + 1))
+                dilated = cv2.dilate(sam3_np, kern_outer, iterations=1)
+                eroded = cv2.erode(sam3_np, kern_inner, iterations=1)
+                edge_band = np.clip(dilated.astype(np.float32) - eroded.astype(np.float32), 0, 1)
+                blur_sz = max(3, (BAND_OUTER + BAND_INNER) | 1)
+                edge_band = cv2.GaussianBlur(edge_band, (blur_sz, blur_sz), 0)
+
+                # Blend: interior = SAM3, edge band = ZIM, exterior = 0
+                base = sam3_np.astype(np.float32)
+                blended = base * (1.0 - edge_band) + zim_alpha * edge_band
+                refined_logits[gi] = torch.from_numpy(np.maximum(base, blended).clip(0, 1))
 
                 if (idx + 1) % 50 == 0:
                     logger.info("[ZIM] Small: %d/%d done", idx + 1, len(small_indices))
@@ -348,13 +380,37 @@ class SAM3Gemstone:
 
                 masks, scores, _ = zim_predictor.predict(box=local_box, multimask_output=False)
 
-                full_alpha = np.zeros((H, W), dtype=np.float32)
-                full_alpha[y1:y2, x1:x2] = masks[0].astype(np.float32)
-                refined_logits[gi] = torch.from_numpy(full_alpha)
+                full_zim = np.zeros((H, W), dtype=np.float32)
+                full_zim[y1:y2, x1:x2] = masks[0].astype(np.float32)
+
+                # SAM3 base mask
+                sam3_mask = all_logits[gi]
+                if isinstance(sam3_mask, torch.Tensor):
+                    sam3_np = (sam3_mask.numpy() > 0.5).astype(np.uint8)
+                else:
+                    sam3_np = np.zeros((H, W), dtype=np.uint8)
+
+                obj_coverage = (full_zim * sam3_np).sum() / max(sam3_np.sum(), 1)
+                if obj_coverage < ZIM_MIN_COVERAGE:
+                    logger.debug("  [ZIM] large det %d: coverage %.1f%% → FALLBACK", gi, obj_coverage * 100)
+                    continue
+
+                kern_outer = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (BAND_OUTER * 2 + 1, BAND_OUTER * 2 + 1))
+                kern_inner = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (BAND_INNER * 2 + 1, BAND_INNER * 2 + 1))
+                dilated = cv2.dilate(sam3_np, kern_outer, iterations=1)
+                eroded = cv2.erode(sam3_np, kern_inner, iterations=1)
+                edge_band = np.clip(dilated.astype(np.float32) - eroded.astype(np.float32), 0, 1)
+                blur_sz = max(3, (BAND_OUTER + BAND_INNER) | 1)
+                edge_band = cv2.GaussianBlur(edge_band, (blur_sz, blur_sz), 0)
+
+                base = sam3_np.astype(np.float32)
+                blended = base * (1.0 - edge_band) + full_zim * edge_band
+                refined_logits[gi] = torch.from_numpy(np.maximum(base, blended).clip(0, 1))
 
             logger.info("[ZIM] %d large objects: %.2fs", len(large_indices), time.time() - t_large)
 
-        logger.info("[ZIM] Total refinement: %.2fs for %d objects", time.time() - t0, len(surviving))
+        logger.info("[ZIM] Total refinement: %.2fs for %d objects (refined %d)",
+                    time.time() - t0, len(surviving), len(refined_logits))
         return refined_logits
 
     # =====================================================================
@@ -752,7 +808,14 @@ class SAM3Gemstone:
         for gi in surviving:
             logit = self._expand_logit(all_logits[gi], H, W)
             unified_logits = torch.max(unified_logits, logit)
-        unified_mask = (unified_logits > 0.5).float()
+
+        # If ZIM refined: logits are already 0-1 alpha with soft edges → keep them
+        # If raw SAM3: logits are raw sigmoid values → binarize at 0.5
+        if zim_predictor is not None:
+            # Clamp to valid range but preserve soft edges from ZIM
+            unified_mask = unified_logits.clamp(0, 1)
+        else:
+            unified_mask = (unified_logits > 0.5).float()
         coverage = unified_mask.mean().item() * 100
         logger.info("[Merge] %d masks merged, coverage: %.1f%%", len(surviving), coverage)
 
@@ -809,6 +872,36 @@ class ZIMRefineMask:
     FUNCTION = "run"
     CATEGORY = "SAM3-Gemstone"
 
+    @staticmethod
+    def _build_edge_band(obj_mask_u8, band_inner, band_outer):
+        """Build a soft edge band around the contour of obj_mask.
+
+        Returns float32 mask where:
+        - interior (far from edge) = 0  (keep original mask)
+        - edge band = 1  (replace with ZIM alpha)
+        - exterior (far from edge) = 0
+
+        The blend transitions smoothly via Gaussian blur.
+        """
+        kern_outer = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE, (band_outer * 2 + 1, band_outer * 2 + 1)
+        )
+        kern_inner = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE, (band_inner * 2 + 1, band_inner * 2 + 1)
+        )
+
+        dilated = cv2.dilate(obj_mask_u8, kern_outer, iterations=1)
+        eroded = cv2.erode(obj_mask_u8, kern_inner, iterations=1)
+
+        # Band = dilated minus eroded (ring around edge)
+        band = np.clip(dilated.astype(np.float32) - eroded.astype(np.float32), 0, 1)
+
+        # Smooth the band edges for soft blending
+        blur_size = max(3, (band_outer + band_inner) | 1)  # ensure odd
+        band = cv2.GaussianBlur(band, (blur_size, blur_size), 0)
+
+        return band
+
     def run(self, image, mask, min_object_area, crop_padding, large_object_pct):
         t0 = time.time()
         B, H, W, C = image.shape
@@ -816,6 +909,12 @@ class ZIMRefineMask:
         logger.info("[ZIM-Refine] START  B=%d  H=%d  W=%d", B, H, W)
 
         predictor = _load_zim_model()
+
+        # Edge band widths — how many pixels around contour to refine
+        BAND_INNER = 5   # pixels inside the contour
+        BAND_OUTER = 10  # pixels outside the contour
+        # Minimum ZIM coverage within object to consider it a valid detection
+        ZIM_MIN_COVERAGE = 0.10
 
         all_masks_out = []
         all_overlays_out = []
@@ -861,7 +960,12 @@ class ZIMRefineMask:
                         len(small_objects), len(large_objects),
                         n_objects - len(small_objects) - len(large_objects))
 
-            unified_alpha = np.zeros((H, W), dtype=np.float32)
+            # ---------------------------------------------------------------
+            # Strategy: original mask is the BASE (interior is always filled).
+            # ZIM only replaces pixels in the EDGE BAND around each object.
+            # If ZIM returns empty/bad alpha → fallback to original mask edges.
+            # ---------------------------------------------------------------
+            unified_alpha = mask_np.astype(np.float32)  # start from original mask
 
             if small_objects:
                 t_small = time.time()
@@ -870,11 +974,26 @@ class ZIMRefineMask:
                 for idx, (label_id, x1, y1, x2, y2) in enumerate(small_objects):
                     bbox_np = np.array([x1, y1, x2, y2], dtype=np.float32)
                     masks_out, scores, _ = predictor.predict(box=bbox_np, multimask_output=False)
-                    alpha = masks_out[0].astype(np.float32)
-                    obj_region = (labels == label_id)
-                    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-                    obj_expanded = cv2.dilate(obj_region.astype(np.uint8), kernel, iterations=2)
-                    unified_alpha = np.maximum(unified_alpha, alpha * obj_expanded)
+                    zim_alpha = masks_out[0].astype(np.float32)
+
+                    obj_mask_u8 = (labels == label_id).astype(np.uint8)
+
+                    # Check if ZIM found anything meaningful in this object area
+                    obj_coverage = (zim_alpha * obj_mask_u8).sum() / max(obj_mask_u8.sum(), 1)
+
+                    if obj_coverage < ZIM_MIN_COVERAGE:
+                        # ZIM didn't find the object → keep original mask
+                        logger.debug("  [ZIM] obj %d: coverage %.1f%% < %.0f%% → FALLBACK",
+                                     label_id, obj_coverage * 100, ZIM_MIN_COVERAGE * 100)
+                        continue
+
+                    # Build edge band and blend ZIM into it
+                    edge_band = self._build_edge_band(obj_mask_u8, BAND_INNER, BAND_OUTER)
+
+                    # In the edge band: use ZIM alpha
+                    # Outside edge band: keep what we have (original mask interior / background)
+                    blended = unified_alpha * (1.0 - edge_band) + zim_alpha * edge_band
+                    unified_alpha = np.maximum(unified_alpha, blended)
 
                     if (idx + 1) % 50 == 0:
                         logger.info("[ZIM-Refine] Small: %d/%d done", idx + 1, len(small_objects))
@@ -896,16 +1015,30 @@ class ZIMRefineMask:
                     masks_out, scores, _ = predictor.predict(box=local_box, multimask_output=False)
 
                     crop_alpha = masks_out[0].astype(np.float32)
-                    obj_region = (labels == label_id)
-                    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-                    obj_expanded = cv2.dilate(obj_region.astype(np.uint8), kernel, iterations=3)
-                    full_alpha = np.zeros((H, W), dtype=np.float32)
-                    full_alpha[cy1:cy2, cx1:cx2] = crop_alpha
-                    unified_alpha = np.maximum(unified_alpha, full_alpha * obj_expanded)
+
+                    # Map ZIM alpha back to full image
+                    full_zim_alpha = np.zeros((H, W), dtype=np.float32)
+                    full_zim_alpha[cy1:cy2, cx1:cx2] = crop_alpha
+
+                    obj_mask_u8 = (labels == label_id).astype(np.uint8)
+
+                    # Check ZIM coverage
+                    obj_coverage = (full_zim_alpha * obj_mask_u8).sum() / max(obj_mask_u8.sum(), 1)
+
+                    if obj_coverage < ZIM_MIN_COVERAGE:
+                        logger.debug("  [ZIM] large obj %d: coverage %.1f%% → FALLBACK",
+                                     label_id, obj_coverage * 100)
+                        continue
+
+                    # Build edge band and blend
+                    edge_band = self._build_edge_band(obj_mask_u8, BAND_INNER, BAND_OUTER)
+
+                    blended = unified_alpha * (1.0 - edge_band) + full_zim_alpha * edge_band
+                    unified_alpha = np.maximum(unified_alpha, blended)
 
                 logger.info("[ZIM-Refine] %d large: %.2fs", len(large_objects), time.time() - t_large)
 
-            refined_mask = torch.from_numpy(unified_alpha)
+            refined_mask = torch.from_numpy(unified_alpha).clamp(0, 1)
 
             img_tensor = image[b_idx].cpu().clone()
             mask_3d = refined_mask.unsqueeze(-1)

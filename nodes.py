@@ -159,6 +159,8 @@ class SAM3Gemstone:
                     "default": 0.50, "min": 0.1, "max": 1.0, "step": 0.05,
                     "tooltip": "NMS IoU overlap threshold — lower = more aggressive dedup",
                 }),
+            },
+            "optional": {
                 "max_detections": ("INT", {
                     "default": 256, "min": 16, "max": 1024, "step": 16,
                     "tooltip": "Max gems to segment with ZIM. Lower = faster. "

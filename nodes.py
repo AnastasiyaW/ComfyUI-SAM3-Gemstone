@@ -23,140 +23,32 @@ if not logger.handlers:
     logger.addHandler(_h)
 
 # ---------------------------------------------------------------------------
-# Model directory
+# Model directory + cache
 # ---------------------------------------------------------------------------
 SAM3_MODEL_DIR = os.path.join(folder_paths.models_dir, "sam3")
 os.makedirs(SAM3_MODEL_DIR, exist_ok=True)
 SAM3_CHECKPOINT = "sam3.pt"
 
-GEMSTONE_PROMPTS = [
-    "gemstone", "precious stone", "cut gemstone", "polished gemstone",
-    "faceted gemstone", "diamond", "ruby", "sapphire", "emerald",
-    "amethyst", "topaz", "opal", "garnet", "tourmaline", "aquamarine",
-    "tanzanite", "alexandrite", "spinel", "peridot", "citrine",
-    "morganite", "kunzite", "zircon", "chrysoberyl", "iolite",
-    "raw crystal", "mineral specimen", "cabochon", "brilliant cut stone",
-    "translucent stone", "transparent crystal", "jewelry stone",
-    "shiny reflective stone",
-]
-
 _sam3_cache: dict = {}
 
 
-def _get_dtype(precision: str) -> torch.dtype:
-    return {"fp16": torch.float16, "bf16": torch.bfloat16, "fp32": torch.float32}[precision]
-
-
 # ============================================================================
-#  1.  LOADER NODE
+#  SINGLE NODE — SAM3 Gemstone Segmentation
 # ============================================================================
-class SAM3GemstoneModelLoader:
-    """Load SAM 3 model. CUDA only, no CPU fallback. Local checkpoint only."""
+class SAM3Gemstone:
+    """All-in-one SAM3 gemstone segmentation node.
+    Loads model (cached), segments gemstones, outputs mask + overlay + stats."""
 
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "precision": (["bf16", "fp16", "fp32"], {"default": "bf16"}),
-                "compile_model": ("BOOLEAN", {"default": False}),
-            },
-        }
-
-    RETURN_TYPES = ("SAM3_MODEL",)
-    RETURN_NAMES = ("sam3_model",)
-    FUNCTION = "load"
-    CATEGORY = "SAM3-Gemstone"
-
-    def load(self, precision: str, compile_model: bool):
-        t0 = time.time()
-        device = mm.get_torch_device()
-        dtype = _get_dtype(precision)
-
-        logger.info("=" * 60)
-        logger.info("LOAD START  device=%s  dtype=%s  compile=%s", device, dtype, compile_model)
-        logger.info("=" * 60)
-
-        assert device.type == "cuda", (
-            f"SAM3-Gemstone requires CUDA. Got device={device}. No CPU fallback."
-        )
-
-        prop = torch.cuda.get_device_properties(device)
-        vram_bytes = getattr(prop, "total_memory", None) or getattr(prop, "total_mem", 0)
-        logger.info("GPU: %s  (compute %d.%d, %.1f GB VRAM)",
-                    prop.name, prop.major, prop.minor, vram_bytes / (1024**3))
-
-        cache_key = f"sam3_{precision}_{compile_model}"
-        if cache_key in _sam3_cache:
-            logger.info("Returning cached model (key=%s)", cache_key)
-            return (_sam3_cache[cache_key],)
-
-        # H100 / Ampere+ fast-math
-        if prop.major >= 8:
-            torch.backends.cuda.matmul.allow_tf32 = True
-            torch.backends.cudnn.allow_tf32 = True
-            torch.backends.cudnn.benchmark = True
-            logger.info("TF32 + cuDNN benchmark enabled (compute >= 8.0)")
-
-        # Checkpoint
-        ckpt_path = os.path.join(SAM3_MODEL_DIR, SAM3_CHECKPOINT)
-        assert os.path.isfile(ckpt_path), (
-            f"Checkpoint NOT FOUND: {ckpt_path}. "
-            f"Place sam3.pt (~3.3 GB) into {SAM3_MODEL_DIR}/"
-        )
-        size_gb = os.path.getsize(ckpt_path) / (1024**3)
-        logger.info("Checkpoint: %s (%.2f GB)", ckpt_path, size_gb)
-        assert size_gb > 1.0, (
-            f"sam3.pt is only {size_gb:.2f} GB — corrupted? Expected ~3.3 GB."
-        )
-
-        # BPE tokenizer
-        import pkg_resources
-        bpe_path = pkg_resources.resource_filename("sam3", "assets/bpe_simple_vocab_16e6.txt.gz")
-        assert os.path.isfile(bpe_path), (
-            f"BPE tokenizer NOT FOUND: {bpe_path}. "
-            f"Copy bpe_simple_vocab_16e6.txt.gz into sam3 package assets."
-        )
-        logger.info("BPE tokenizer: %s", bpe_path)
-
-        # Build model
-        logger.info("Building SAM3 image model...")
-        from sam3.model_builder import build_sam3_image_model
-
-        model = build_sam3_image_model(
-            bpe_path=bpe_path,
-            device=str(device),
-            checkpoint_path=ckpt_path,
-            load_from_HF=False,
-            compile=compile_model,
-        )
-        logger.info("Model built. Moving to device=%s dtype=%s ...", device, dtype)
-        model = model.to(device=device, dtype=dtype)
-        model.eval()
-
-        first_param = next(model.parameters())
-        logger.info("Model param check: device=%s  dtype=%s", first_param.device, first_param.dtype)
-        assert first_param.is_cuda, f"Model on {first_param.device}, expected CUDA."
-
-        pipe = {"model": model, "device": device, "dtype": dtype}
-        _sam3_cache[cache_key] = pipe
-
-        logger.info("LOAD DONE in %.1fs", time.time() - t0)
-        return (pipe,)
-
-
-# ============================================================================
-#  2.  SEGMENTATION NODE — Quality pipeline
-# ============================================================================
-class SAM3GemstoneSegmentation:
-    """Segment gemstones with maximum quality. Multi-prompt + NMS + SAHI + filtering.
-    Outputs a UNIFIED mask of ALL detected gemstones."""
-
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "sam3_model": ("SAM3_MODEL",),
                 "image": ("IMAGE",),
+                "prompt": ("STRING", {
+                    "default": "diamond",
+                    "multiline": True,
+                    "placeholder": "One prompt per line. 'diamond' works best.",
+                }),
                 "score_threshold": ("FLOAT", {
                     "default": 0.30, "min": 0.01, "max": 1.0, "step": 0.01,
                     "display": "slider",
@@ -192,23 +84,97 @@ class SAM3GemstoneSegmentation:
                     "default": 3, "min": 0, "max": 15, "step": 2,
                 }),
                 "keep_model_loaded": ("BOOLEAN", {"default": True}),
-            },
-            "optional": {
-                "multi_prompt": ("STRING", {
-                    "default": "diamond",
-                    "multiline": True,
-                    "placeholder": "One prompt per line. 'diamond' works best.",
-                }),
+                "compile_model": ("BOOLEAN", {"default": False}),
             },
         }
 
-    RETURN_TYPES = ("IMAGE", "MASK", "IMAGE")
-    RETURN_NAMES = ("overlay_image", "gemstone_mask", "cropped_gems")
-    FUNCTION = "segment"
+    RETURN_TYPES = ("IMAGE", "MASK", "IMAGE", "STRING", "INT", "FLOAT")
+    RETURN_NAMES = ("overlay", "mask", "cropped", "stats_text", "gem_count", "coverage_pct")
+    FUNCTION = "run"
     CATEGORY = "SAM3-Gemstone"
+    OUTPUT_NODE = True
 
-    # ----- helpers --------------------------------------------------------
+    # =====================================================================
+    #  Model loading (cached)
+    # =====================================================================
+    def _load_model(self, compile_model: bool):
+        t0 = time.time()
+        device = mm.get_torch_device()
 
+        logger.info("=" * 60)
+        logger.info("LOAD START  device=%s  compile=%s", device, compile_model)
+        logger.info("=" * 60)
+
+        assert device.type == "cuda", (
+            f"SAM3-Gemstone requires CUDA. Got device={device}. No CPU fallback."
+        )
+
+        prop = torch.cuda.get_device_properties(device)
+        vram_bytes = getattr(prop, "total_memory", None) or getattr(prop, "total_mem", 0)
+        logger.info("GPU: %s  (compute %d.%d, %.1f GB VRAM)",
+                    prop.name, prop.major, prop.minor, vram_bytes / (1024**3))
+
+        cache_key = f"sam3_{compile_model}"
+        if cache_key in _sam3_cache:
+            logger.info("Returning cached model (key=%s)", cache_key)
+            return _sam3_cache[cache_key]
+
+        # H100 / Ampere+ fast-math
+        if prop.major >= 8:
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            torch.backends.cudnn.benchmark = True
+            logger.info("TF32 + cuDNN benchmark enabled (compute >= 8.0)")
+
+        # Checkpoint
+        ckpt_path = os.path.join(SAM3_MODEL_DIR, SAM3_CHECKPOINT)
+        assert os.path.isfile(ckpt_path), (
+            f"Checkpoint NOT FOUND: {ckpt_path}. "
+            f"Place sam3.pt (~3.3 GB) into {SAM3_MODEL_DIR}/"
+        )
+        size_gb = os.path.getsize(ckpt_path) / (1024**3)
+        logger.info("Checkpoint: %s (%.2f GB)", ckpt_path, size_gb)
+        assert size_gb > 1.0, (
+            f"sam3.pt is only {size_gb:.2f} GB — corrupted? Expected ~3.3 GB."
+        )
+
+        # BPE tokenizer
+        import pkg_resources
+        bpe_path = pkg_resources.resource_filename("sam3", "assets/bpe_simple_vocab_16e6.txt.gz")
+        assert os.path.isfile(bpe_path), (
+            f"BPE tokenizer NOT FOUND: {bpe_path}. "
+            f"Copy bpe_simple_vocab_16e6.txt.gz into sam3 package assets."
+        )
+        logger.info("BPE tokenizer: %s", bpe_path)
+
+        # Build model — always fp32 (Sam3Processor requires fp32 input compatibility)
+        logger.info("Building SAM3 image model...")
+        from sam3.model_builder import build_sam3_image_model
+
+        model = build_sam3_image_model(
+            bpe_path=bpe_path,
+            device=str(device),
+            checkpoint_path=ckpt_path,
+            load_from_HF=False,
+            compile=compile_model,
+        )
+        logger.info("Model built. Moving to device=%s fp32...", device)
+        model = model.to(device=device, dtype=torch.float32)
+        model.eval()
+
+        first_param = next(model.parameters())
+        logger.info("Model param check: device=%s  dtype=%s", first_param.device, first_param.dtype)
+        assert first_param.is_cuda, f"Model on {first_param.device}, expected CUDA."
+
+        pipe = {"model": model, "device": device}
+        _sam3_cache[cache_key] = pipe
+
+        logger.info("LOAD DONE in %.1fs", time.time() - t0)
+        return pipe
+
+    # =====================================================================
+    #  Helpers
+    # =====================================================================
     @staticmethod
     def _expand_mask(mask: torch.Tensor, pixels: int) -> torch.Tensor:
         if pixels == 0:
@@ -274,16 +240,16 @@ class SAM3GemstoneSegmentation:
             with torch.inference_mode():
                 result = processor.set_text_prompt(prompt=prompt_text, state=state)
 
-            masks_logits = result["masks_logits"]  # [N, 1, H, W] float
-            boxes = result["boxes"]                 # [N, 4] xyxy
-            scores = result["scores"]               # [N]
+            masks_logits = result["masks_logits"]   # [N, 1, H, W] float
+            boxes = result["boxes"]                  # [N, 4] xyxy
+            scores = result["scores"]                # [N]
 
             n = scores.shape[0] if scores.ndim > 0 else (1 if scores.numel() > 0 else 0)
             logger.info("  Prompt %d/%d '%s': %d detections (%.2fs)",
                         p_idx + 1, len(prompts), prompt_text, n, time.time() - t_p)
 
             if n > 0:
-                logits_cpu = masks_logits.squeeze(1).cpu()  # [N, H, W]
+                logits_cpu = masks_logits.squeeze(1).cpu()   # [N, H, W]
                 boxes_cpu = boxes.cpu()
                 scores_cpu = scores.cpu()
                 if logits_cpu.ndim == 2:
@@ -303,12 +269,22 @@ class SAM3GemstoneSegmentation:
 
         return all_logits, all_boxes, all_scores
 
-    # ----- main -----------------------------------------------------------
+    def _compute_stats(self, mask: torch.Tensor, H: int, W: int) -> tuple:
+        """Compute gem count and coverage from binary mask."""
+        binary = (mask > 0.5).cpu().numpy().astype(np.uint8)
+        total_pixels = H * W
+        coverage = binary.sum() / total_pixels * 100
+        num_labels, _ = cv2.connectedComponents(binary, connectivity=4)
+        n_gems = num_labels - 1   # subtract background
+        return n_gems, round(coverage, 2)
 
-    def segment(
+    # =====================================================================
+    #  Main execution
+    # =====================================================================
+    def run(
         self,
-        sam3_model: dict,
         image: torch.Tensor,
+        prompt: str,
         score_threshold: float,
         nms_iou_threshold: float,
         min_solidity: float,
@@ -321,34 +297,28 @@ class SAM3GemstoneSegmentation:
         sahi_overlap: float,
         morph_close_size: int,
         keep_model_loaded: bool,
-        multi_prompt: str = "diamond",
+        compile_model: bool,
     ):
         t0 = time.time()
-        model = sam3_model["model"]
-        device = sam3_model["device"]
-        dtype = sam3_model["dtype"]
+
+        # --- Load / get cached model ---
+        pipe = self._load_model(compile_model)
+        model = pipe["model"]
+        device = pipe["device"]
 
         logger.info("=" * 60)
-        logger.info("SEGMENT START  device=%s  dtype=%s", device, dtype)
+        logger.info("SEGMENT START  device=%s", device)
         logger.info("Image shape: %s  dtype: %s", image.shape, image.dtype)
         logger.info("=" * 60)
 
         # Resolve prompts
-        prompts = [p.strip() for p in multi_prompt.strip().splitlines() if p.strip()]
+        prompts = [p.strip() for p in prompt.strip().splitlines() if p.strip()]
         if not prompts:
             prompts = ["diamond"]
         logger.info("Prompts (%d): %s", len(prompts), prompts)
 
         # Build processor with LOW threshold — we filter ourselves
         from sam3.model.sam3_image_processor import Sam3Processor
-
-        # Sam3Processor feeds float32 images into backbone.
-        # Model must be in float32 for compatibility (SAM3 was designed for fp32).
-        # The checkpoint is 3.3GB → ~6.4GB fp32 in VRAM, fine for H100.
-        if dtype != torch.float32:
-            logger.info("Casting model to float32 for Sam3Processor compatibility (was %s)", dtype)
-            model.float()
-
         processor = Sam3Processor(model, confidence_threshold=0.01)
 
         model.to(device)
@@ -358,6 +328,9 @@ class SAM3GemstoneSegmentation:
         all_masks_out = []
         all_overlays_out = []
         all_cropped_out = []
+        total_gems = 0
+        total_coverage = 0.0
+        stats_lines = []
 
         for b_idx in range(B):
             t_batch = time.time()
@@ -394,7 +367,6 @@ class SAM3GemstoneSegmentation:
 
                     # Remap to full image coords
                     for i in range(len(t_scores)):
-                        # Box remap
                         box = t_boxes[i].clone()
                         box[0] += tx1
                         box[1] += ty1
@@ -403,10 +375,8 @@ class SAM3GemstoneSegmentation:
                         all_boxes.append(box)
                         all_scores.append(t_scores[i])
 
-                        # Mask remap — pad tile logit into full image
                         full_logit = torch.zeros(H, W, dtype=torch.float32)
                         tile_logit = t_logits[i]
-                        # tile_logit is [tile_h, tile_w] — might differ slightly due to processor resize
                         if tile_logit.shape[0] != tile_h or tile_logit.shape[1] != tile_w:
                             tile_logit = torch.nn.functional.interpolate(
                                 tile_logit.unsqueeze(0).unsqueeze(0),
@@ -428,7 +398,6 @@ class SAM3GemstoneSegmentation:
                 boxes_t = torch.stack(all_boxes).to(device)
                 scores_t = torch.stack(all_scores).to(device)
 
-                # Filter by score_threshold first
                 above = scores_t >= score_threshold
                 indices_above = above.nonzero(as_tuple=True)[0]
                 logger.info("[Filter] Score >= %.2f: %d / %d",
@@ -457,7 +426,6 @@ class SAM3GemstoneSegmentation:
                         area_pct = mask_area / image_area * 100
                         score_val = all_scores[gi].item()
 
-                        # Area filter
                         if area_pct < min_area_pct:
                             logger.debug("    [SKIP] det %d: area %.4f%% < min %.4f%%",
                                          gi, area_pct, min_area_pct)
@@ -467,7 +435,6 @@ class SAM3GemstoneSegmentation:
                                          gi, area_pct, max_area_pct)
                             continue
 
-                        # Solidity filter
                         if min_solidity > 0 and not self._check_solidity(binary_np, min_solidity):
                             logger.debug("    [SKIP] det %d: solidity below %.2f", gi, min_solidity)
                             continue
@@ -493,7 +460,7 @@ class SAM3GemstoneSegmentation:
                     else:
                         unified_logits = torch.zeros(H, W, dtype=torch.float32)
                         for gi in surviving:
-                            logit = all_logits[gi]  # [H, W] float [0, 1]
+                            logit = all_logits[gi]
                             unified_logits = torch.max(unified_logits, logit)
                         unified_mask = (unified_logits > 0.5).float()
                         coverage = unified_mask.mean().item() * 100
@@ -508,7 +475,14 @@ class SAM3GemstoneSegmentation:
             if morph_close_size > 0 and unified_mask.sum() > 0:
                 unified_mask = self._morph_close(unified_mask, morph_close_size)
 
-            # 11. Generate outputs
+            # 11. Stats
+            n_gems, cov_pct = self._compute_stats(unified_mask, H, W)
+            total_gems += n_gems
+            total_coverage += cov_pct
+            stats_lines.append(f"[Batch {b_idx}] Gems: {n_gems} | Coverage: {cov_pct}% | {W}x{H}")
+            logger.info("  Stats: %d gems, %.1f%% coverage", n_gems, cov_pct)
+
+            # 12. Generate outputs
             img_tensor = image[b_idx].cpu().clone()
             mask_3d = unified_mask.unsqueeze(-1)
 
@@ -539,185 +513,26 @@ class SAM3GemstoneSegmentation:
         overlay_batch = torch.stack(all_overlays_out, dim=0)
         cropped_batch = torch.stack(all_cropped_out, dim=0)
 
+        # Final stats
+        avg_coverage = total_coverage / B if B > 0 else 0.0
+        stats_lines.insert(0, f"=== SAM3 Gemstone ({B} images) ===")
+        stats_lines.append(f"Total gems: {total_gems} | Avg coverage: {avg_coverage:.1f}%")
+        stats_text = "\n".join(stats_lines)
+
         logger.info("SEGMENT DONE in %.1fs  shapes: overlay=%s mask=%s cropped=%s",
                     time.time() - t0, overlay_batch.shape, mask_batch.shape, cropped_batch.shape)
+        logger.info("Stats: %d gems, %.1f%% avg coverage", total_gems, avg_coverage)
 
-        return (overlay_batch, mask_batch, cropped_batch)
-
-
-# ============================================================================
-#  3.  MULTI-PROMPT BUILDER NODE
-# ============================================================================
-class SAM3GemstonePromptBuilder:
-    """Build a multi-line prompt list from gemstone category toggles."""
-
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "diamonds": ("BOOLEAN", {"default": True}),
-                "rubies": ("BOOLEAN", {"default": True}),
-                "sapphires": ("BOOLEAN", {"default": True}),
-                "emeralds": ("BOOLEAN", {"default": True}),
-                "amethysts": ("BOOLEAN", {"default": False}),
-                "opals": ("BOOLEAN", {"default": False}),
-                "topazes": ("BOOLEAN", {"default": False}),
-                "garnets": ("BOOLEAN", {"default": False}),
-                "tourmalines": ("BOOLEAN", {"default": False}),
-                "pearls": ("BOOLEAN", {"default": False}),
-                "generic_gemstone": ("BOOLEAN", {"default": True}),
-                "raw_crystals": ("BOOLEAN", {"default": False}),
-                "custom_additions": ("STRING", {
-                    "default": "",
-                    "multiline": True,
-                    "placeholder": "Additional prompts, one per line",
-                }),
-            },
-        }
-
-    RETURN_TYPES = ("STRING",)
-    RETURN_NAMES = ("multi_prompt",)
-    FUNCTION = "build"
-    CATEGORY = "SAM3-Gemstone"
-
-    _MAP = {
-        "diamonds": "diamond", "rubies": "ruby", "sapphires": "sapphire",
-        "emeralds": "emerald", "amethysts": "amethyst", "opals": "opal",
-        "topazes": "topaz", "garnets": "garnet", "tourmalines": "tourmaline",
-        "pearls": "pearl", "generic_gemstone": "gemstone", "raw_crystals": "raw crystal",
-    }
-
-    def build(self, custom_additions: str = "", **kwargs):
-        lines = [self._MAP[k] for k, v in kwargs.items() if v and k in self._MAP]
-        if custom_additions.strip():
-            lines.extend([l.strip() for l in custom_additions.splitlines() if l.strip()])
-        logger.info("PromptBuilder: %s", lines)
-        return ("\n".join(lines),)
-
-
-# ============================================================================
-#  4.  MASK POST-PROCESSOR NODE
-# ============================================================================
-class SAM3GemstoneMaskPostProcess:
-    """Refine gemstone mask: smooth edges, threshold, expand/erode."""
-
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "mask": ("MASK",),
-                "smooth_radius": ("INT", {"default": 3, "min": 0, "max": 31, "step": 1}),
-                "binary_threshold": ("FLOAT", {
-                    "default": 0.5, "min": 0.0, "max": 1.0, "step": 0.01, "display": "slider",
-                }),
-                "expand_pixels": ("INT", {"default": 0, "min": -50, "max": 50, "step": 1}),
-                "invert": ("BOOLEAN", {"default": False}),
-            },
-        }
-
-    RETURN_TYPES = ("MASK",)
-    RETURN_NAMES = ("refined_mask",)
-    FUNCTION = "process"
-    CATEGORY = "SAM3-Gemstone"
-
-    def process(self, mask: torch.Tensor, smooth_radius: int,
-                binary_threshold: float, expand_pixels: int, invert: bool):
-        logger.info("MaskPostProcess: shape=%s smooth=%d thresh=%.2f expand=%d invert=%s",
-                    mask.shape, smooth_radius, binary_threshold, expand_pixels, invert)
-        result = mask.clone().float()
-
-        if smooth_radius > 0:
-            ks = smooth_radius * 2 + 1
-            sigma = smooth_radius / 2.0
-            coords = torch.arange(ks, dtype=torch.float32) - smooth_radius
-            kernel_1d = torch.exp(-coords ** 2 / (2 * sigma ** 2))
-            kernel_1d = kernel_1d / kernel_1d.sum()
-            kernel_2d = kernel_1d.unsqueeze(1) @ kernel_1d.unsqueeze(0)
-            kernel_2d = kernel_2d.unsqueeze(0).unsqueeze(0)
-            pad = smooth_radius
-            for b in range(result.shape[0]):
-                m = result[b].unsqueeze(0).unsqueeze(0)
-                m = torch.nn.functional.pad(m, (pad, pad, pad, pad), mode="reflect")
-                m = torch.nn.functional.conv2d(m, kernel_2d)
-                result[b] = m.squeeze(0).squeeze(0)
-
-        if binary_threshold > 0:
-            result = (result >= binary_threshold).float()
-        if expand_pixels != 0:
-            for b in range(result.shape[0]):
-                result[b] = SAM3GemstoneSegmentation._expand_mask(result[b], expand_pixels)
-        if invert:
-            result = 1.0 - result
-
-        logger.info("MaskPostProcess done: shape=%s", result.shape)
-        return (result.clamp(0, 1),)
-
-
-# ============================================================================
-#  5.  STATS NODE
-# ============================================================================
-class SAM3GemstoneStats:
-    """Output statistics about detected gemstones."""
-
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "mask": ("MASK",),
-                "image": ("IMAGE",),
-            },
-        }
-
-    RETURN_TYPES = ("STRING", "INT", "FLOAT")
-    RETURN_NAMES = ("stats_text", "gem_count", "coverage_pct")
-    FUNCTION = "compute"
-    CATEGORY = "SAM3-Gemstone"
-    OUTPUT_NODE = True
-
-    def compute(self, mask: torch.Tensor, image: torch.Tensor):
-        B, H, W = mask.shape
-        total_pixels = H * W
-        logger.info("Stats: B=%d H=%d W=%d", B, H, W)
-
-        lines = []
-        total_gems = 0
-        total_coverage = 0.0
-
-        for b in range(B):
-            binary = (mask[b] > 0.5).cpu().numpy().astype(np.uint8)
-            coverage = binary.sum() / total_pixels * 100
-            num_labels, _ = cv2.connectedComponents(binary, connectivity=4)
-            n_gems = num_labels - 1  # subtract background label
-
-            total_gems += n_gems
-            total_coverage += coverage
-
-            line = f"[Batch {b}] Gems: {n_gems} | Coverage: {coverage:.1f}% | {W}x{H}"
-            logger.info("  %s", line)
-            lines.append(line)
-
-        avg_coverage = total_coverage / B if B > 0 else 0.0
-        lines.insert(0, f"=== SAM3 Gemstone Stats ({B} images) ===")
-        lines.append(f"Total gems: {total_gems} | Avg coverage: {avg_coverage:.1f}%")
-
-        return ("\n".join(lines), total_gems, round(avg_coverage, 2))
+        return (overlay_batch, mask_batch, cropped_batch, stats_text, total_gems, round(avg_coverage, 2))
 
 
 # ============================================================================
 #  MAPPINGS
 # ============================================================================
 NODE_CLASS_MAPPINGS = {
-    "SAM3GemstoneModelLoader": SAM3GemstoneModelLoader,
-    "SAM3GemstoneSegmentation": SAM3GemstoneSegmentation,
-    "SAM3GemstonePromptBuilder": SAM3GemstonePromptBuilder,
-    "SAM3GemstoneMaskPostProcess": SAM3GemstoneMaskPostProcess,
-    "SAM3GemstoneStats": SAM3GemstoneStats,
+    "SAM3Gemstone": SAM3Gemstone,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "SAM3GemstoneModelLoader": "SAM3 Gemstone Model Loader",
-    "SAM3GemstoneSegmentation": "SAM3 Gemstone Segmentation",
-    "SAM3GemstonePromptBuilder": "SAM3 Gemstone Prompt Builder",
-    "SAM3GemstoneMaskPostProcess": "SAM3 Gemstone Mask PostProcess",
-    "SAM3GemstoneStats": "SAM3 Gemstone Stats",
+    "SAM3Gemstone": "SAM3 Gemstone",
 }

@@ -325,7 +325,7 @@ class SAM3Gemstone:
         # for rare categories like jewelry/gemstones (0.4-0.8 -> 0.03-0.06).
         # We use raw pred_logits.sigmoid() instead.
         import types
-        from sam3.model.utils.box_ops import box_cxcywh_to_xyxy
+        from sam3.model.box_ops import box_cxcywh_to_xyxy
         from torch.nn.functional import interpolate as F_interpolate
 
         @torch.inference_mode()

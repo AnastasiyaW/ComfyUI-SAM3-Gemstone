@@ -3,10 +3,12 @@ import time
 import logging
 import torch
 import numpy as np
+import cv2
 from PIL import Image
 
 import comfy.model_management as mm
 import folder_paths
+from torchvision.ops import nms
 
 # ---------------------------------------------------------------------------
 # Logging — verbose, no silence
@@ -21,18 +23,12 @@ if not logger.handlers:
     logger.addHandler(_h)
 
 # ---------------------------------------------------------------------------
-# Model directory — ComfyUI/models/sam3/
+# Model directory
 # ---------------------------------------------------------------------------
 SAM3_MODEL_DIR = os.path.join(folder_paths.models_dir, "sam3")
 os.makedirs(SAM3_MODEL_DIR, exist_ok=True)
-
-SAM3_HF_REPO = "facebook/sam3"
 SAM3_CHECKPOINT = "sam3.pt"
-SAM3_CONFIG = "config.json"
 
-# ---------------------------------------------------------------------------
-# Gemstone-specific text prompts
-# ---------------------------------------------------------------------------
 GEMSTONE_PROMPTS = [
     "gemstone", "precious stone", "cut gemstone", "polished gemstone",
     "faceted gemstone", "diamond", "ruby", "sapphire", "emerald",
@@ -44,9 +40,6 @@ GEMSTONE_PROMPTS = [
     "shiny reflective stone",
 ]
 
-# ---------------------------------------------------------------------------
-# Global model cache
-# ---------------------------------------------------------------------------
 _sam3_cache: dict = {}
 
 
@@ -58,17 +51,12 @@ def _get_dtype(precision: str) -> torch.dtype:
 #  1.  LOADER NODE
 # ============================================================================
 class SAM3GemstoneModelLoader:
-    """Load SAM 3 model. CUDA only, no CPU fallback."""
+    """Load SAM 3 model. CUDA only, no CPU fallback. Local checkpoint only."""
 
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "hf_token": ("STRING", {
-                    "default": "",
-                    "multiline": False,
-                    "placeholder": "hf_... (required for gated facebook/sam3)",
-                }),
                 "precision": (["bf16", "fp16", "fp32"], {"default": "bf16"}),
                 "compile_model": ("BOOLEAN", {"default": False}),
             },
@@ -79,56 +67,8 @@ class SAM3GemstoneModelLoader:
     FUNCTION = "load"
     CATEGORY = "SAM3-Gemstone"
 
-    @staticmethod
-    def _ensure_checkpoint(hf_token: str) -> str:
-        ckpt_path = os.path.join(SAM3_MODEL_DIR, SAM3_CHECKPOINT)
-        cfg_path = os.path.join(SAM3_MODEL_DIR, SAM3_CONFIG)
-
-        logger.info("Checking checkpoint: %s", ckpt_path)
-        logger.info("Checking config:     %s", cfg_path)
-
-        if os.path.isfile(ckpt_path) and os.path.isfile(cfg_path):
-            size_gb = os.path.getsize(ckpt_path) / (1024**3)
-            logger.info("Checkpoint found: %.2f GB", size_gb)
-            assert size_gb > 1.0, (
-                f"sam3.pt is only {size_gb:.2f} GB — looks corrupted or incomplete. "
-                f"Expected ~3.3 GB. Delete and re-download."
-            )
-            return ckpt_path
-
-        # Need to download
-        from huggingface_hub import hf_hub_download
-
-        token = hf_token.strip()
-        assert token, (
-            "HuggingFace token is REQUIRED to download facebook/sam3 (gated repo). "
-            "Get a token at https://huggingface.co/settings/tokens and request access at "
-            "https://huggingface.co/facebook/sam3"
-        )
-
-        logger.info("Downloading %s from %s ...", SAM3_CHECKPOINT, SAM3_HF_REPO)
-        hf_hub_download(repo_id=SAM3_HF_REPO, filename=SAM3_CHECKPOINT,
-                        local_dir=SAM3_MODEL_DIR, token=token)
-
-        logger.info("Downloading %s ...", SAM3_CONFIG)
-        hf_hub_download(repo_id=SAM3_HF_REPO, filename=SAM3_CONFIG,
-                        local_dir=SAM3_MODEL_DIR, token=token)
-
-        for fname in ("tokenizer.json", "tokenizer_config.json",
-                      "vocab.json", "merges.txt", "special_tokens_map.json",
-                      "processor_config.json"):
-            target = os.path.join(SAM3_MODEL_DIR, fname)
-            if not os.path.isfile(target):
-                logger.info("Downloading %s ...", fname)
-                hf_hub_download(repo_id=SAM3_HF_REPO, filename=fname,
-                                local_dir=SAM3_MODEL_DIR, token=token)
-
-        logger.info("All files downloaded to %s", SAM3_MODEL_DIR)
-        return ckpt_path
-
-    def load(self, hf_token: str, precision: str, compile_model: bool):
+    def load(self, precision: str, compile_model: bool):
         t0 = time.time()
-
         device = mm.get_torch_device()
         dtype = _get_dtype(precision)
 
@@ -136,42 +76,48 @@ class SAM3GemstoneModelLoader:
         logger.info("LOAD START  device=%s  dtype=%s  compile=%s", device, dtype, compile_model)
         logger.info("=" * 60)
 
-        # --- HARD: CUDA only ---
         assert device.type == "cuda", (
-            f"SAM3-Gemstone requires CUDA. Got device={device}. "
-            f"No CPU fallback. Check GPU availability."
+            f"SAM3-Gemstone requires CUDA. Got device={device}. No CPU fallback."
         )
 
         prop = torch.cuda.get_device_properties(device)
         logger.info("GPU: %s  (compute %d.%d, %.1f GB VRAM)",
-                    prop.name, prop.major, prop.minor,
-                    prop.total_mem / (1024**3))
+                    prop.name, prop.major, prop.minor, prop.total_mem / (1024**3))
 
         cache_key = f"sam3_{precision}_{compile_model}"
         if cache_key in _sam3_cache:
             logger.info("Returning cached model (key=%s)", cache_key)
             return (_sam3_cache[cache_key],)
 
-        # --- H100 / Ampere+ fast-math ---
+        # H100 / Ampere+ fast-math
         if prop.major >= 8:
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.allow_tf32 = True
             torch.backends.cudnn.benchmark = True
             logger.info("TF32 + cuDNN benchmark enabled (compute >= 8.0)")
 
-        # --- Checkpoint ---
-        ckpt_path = self._ensure_checkpoint(hf_token)
+        # Checkpoint
+        ckpt_path = os.path.join(SAM3_MODEL_DIR, SAM3_CHECKPOINT)
+        assert os.path.isfile(ckpt_path), (
+            f"Checkpoint NOT FOUND: {ckpt_path}. "
+            f"Place sam3.pt (~3.3 GB) into {SAM3_MODEL_DIR}/"
+        )
+        size_gb = os.path.getsize(ckpt_path) / (1024**3)
+        logger.info("Checkpoint: %s (%.2f GB)", ckpt_path, size_gb)
+        assert size_gb > 1.0, (
+            f"sam3.pt is only {size_gb:.2f} GB — corrupted? Expected ~3.3 GB."
+        )
 
-        # --- BPE tokenizer ---
+        # BPE tokenizer
         import pkg_resources
         bpe_path = pkg_resources.resource_filename("sam3", "assets/bpe_simple_vocab_16e6.txt.gz")
         assert os.path.isfile(bpe_path), (
-            f"BPE tokenizer NOT FOUND at {bpe_path}. "
-            f"Install full sam3 package or copy bpe_simple_vocab_16e6.txt.gz to that path."
+            f"BPE tokenizer NOT FOUND: {bpe_path}. "
+            f"Copy bpe_simple_vocab_16e6.txt.gz into sam3 package assets."
         )
         logger.info("BPE tokenizer: %s", bpe_path)
 
-        # --- Build model ---
+        # Build model
         logger.info("Building SAM3 image model...")
         from sam3.model_builder import build_sam3_image_model
 
@@ -183,30 +129,26 @@ class SAM3GemstoneModelLoader:
             compile=compile_model,
         )
         logger.info("Model built. Moving to dtype=%s ...", dtype)
-
         model = model.to(dtype=dtype)
         model.eval()
 
-        # --- Verify model is on CUDA ---
         first_param = next(model.parameters())
-        logger.info("Model first param: device=%s  dtype=%s", first_param.device, first_param.dtype)
-        assert first_param.is_cuda, (
-            f"Model ended up on {first_param.device}, expected CUDA. Something is wrong."
-        )
+        logger.info("Model param check: device=%s  dtype=%s", first_param.device, first_param.dtype)
+        assert first_param.is_cuda, f"Model on {first_param.device}, expected CUDA."
 
         pipe = {"model": model, "device": device, "dtype": dtype}
         _sam3_cache[cache_key] = pipe
 
-        elapsed = time.time() - t0
-        logger.info("LOAD DONE in %.1fs", elapsed)
+        logger.info("LOAD DONE in %.1fs", time.time() - t0)
         return (pipe,)
 
 
 # ============================================================================
-#  2.  SEGMENTATION NODE
+#  2.  SEGMENTATION NODE — Quality pipeline
 # ============================================================================
 class SAM3GemstoneSegmentation:
-    """Segment gemstones using SAM 3 text prompts. CUDA only."""
+    """Segment gemstones with maximum quality. Multi-prompt + NMS + SAHI + filtering.
+    Outputs a UNIFIED mask of ALL detected gemstones."""
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -214,29 +156,47 @@ class SAM3GemstoneSegmentation:
             "required": {
                 "sam3_model": ("SAM3_MODEL",),
                 "image": ("IMAGE",),
-                "prompt_preset": (["custom"] + GEMSTONE_PROMPTS, {"default": "gemstone"}),
-                "custom_prompt": ("STRING", {
-                    "default": "",
-                    "multiline": False,
-                    "placeholder": "e.g. 'blue sapphire on velvet'",
-                }),
                 "score_threshold": ("FLOAT", {
-                    "default": 0.35, "min": 0.01, "max": 1.0, "step": 0.01,
+                    "default": 0.30, "min": 0.01, "max": 1.0, "step": 0.01,
                     "display": "slider",
                 }),
+                "nms_iou_threshold": ("FLOAT", {
+                    "default": 0.50, "min": 0.10, "max": 0.95, "step": 0.05,
+                    "display": "slider",
+                }),
+                "min_solidity": ("FLOAT", {
+                    "default": 0.30, "min": 0.0, "max": 1.0, "step": 0.05,
+                    "display": "slider",
+                }),
+                "min_area_pct": ("FLOAT", {
+                    "default": 0.005, "min": 0.0, "max": 5.0, "step": 0.005,
+                }),
+                "max_area_pct": ("FLOAT", {
+                    "default": 15.0, "min": 1.0, "max": 100.0, "step": 1.0,
+                }),
                 "max_detections": ("INT", {
-                    "default": 64, "min": 1, "max": 256, "step": 1,
+                    "default": 128, "min": 1, "max": 512, "step": 1,
                 }),
                 "mask_expansion": ("INT", {
                     "default": 0, "min": -50, "max": 50, "step": 1,
+                }),
+                "enable_sahi": ("BOOLEAN", {"default": True}),
+                "sahi_tile_size": ("INT", {
+                    "default": 1024, "min": 512, "max": 2048, "step": 128,
+                }),
+                "sahi_overlap": ("FLOAT", {
+                    "default": 0.3, "min": 0.1, "max": 0.5, "step": 0.05,
+                }),
+                "morph_close_size": ("INT", {
+                    "default": 3, "min": 0, "max": 15, "step": 2,
                 }),
                 "keep_model_loaded": ("BOOLEAN", {"default": True}),
             },
             "optional": {
                 "multi_prompt": ("STRING", {
-                    "default": "",
+                    "default": "diamond",
                     "multiline": True,
-                    "placeholder": "One prompt per line for multi-class segmentation",
+                    "placeholder": "One prompt per line. 'diamond' works best.",
                 }),
             },
         }
@@ -245,6 +205,8 @@ class SAM3GemstoneSegmentation:
     RETURN_NAMES = ("overlay_image", "gemstone_mask", "cropped_gems")
     FUNCTION = "segment"
     CATEGORY = "SAM3-Gemstone"
+
+    # ----- helpers --------------------------------------------------------
 
     @staticmethod
     def _expand_mask(mask: torch.Tensor, pixels: int) -> torch.Tensor:
@@ -259,20 +221,108 @@ class SAM3GemstoneSegmentation:
             m = -torch.nn.functional.max_pool2d(-m, kernel_size=kernel_size, stride=1, padding=pad)
         return m.squeeze(0).squeeze(0).clamp(0, 1)
 
+    @staticmethod
+    def _get_tiles(H: int, W: int, tile_size: int, overlap: float) -> list:
+        step = int(tile_size * (1 - overlap))
+        tiles = []
+        seen = set()
+        for y in range(0, H, step):
+            for x in range(0, W, step):
+                x2 = min(x + tile_size, W)
+                y2 = min(y + tile_size, H)
+                x1 = max(0, x2 - tile_size)
+                y1 = max(0, y2 - tile_size)
+                key = (x1, y1, x2, y2)
+                if key not in seen:
+                    seen.add(key)
+                    tiles.append(key)
+        return tiles
+
+    @staticmethod
+    def _check_solidity(mask_np: np.ndarray, min_solidity: float) -> bool:
+        contours, _ = cv2.findContours(
+            mask_np.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
+        if not contours:
+            return False
+        cnt = max(contours, key=cv2.contourArea)
+        hull = cv2.convexHull(cnt)
+        hull_area = cv2.contourArea(hull)
+        if hull_area == 0:
+            return False
+        solidity = cv2.contourArea(cnt) / hull_area
+        return solidity >= min_solidity
+
+    @staticmethod
+    def _morph_close(mask_t: torch.Tensor, kernel_size: int) -> torch.Tensor:
+        if kernel_size <= 0:
+            return mask_t
+        mask_np = (mask_t.cpu().numpy() * 255).astype(np.uint8)
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
+        closed = cv2.morphologyEx(mask_np, cv2.MORPH_CLOSE, kernel, iterations=1)
+        return torch.from_numpy(closed.astype(np.float32) / 255.0)
+
+    def _run_prompts(self, processor, state, prompts):
+        """Run multiple prompts on cached image state. Returns (logits, boxes, scores) lists."""
+        all_logits = []
+        all_boxes = []
+        all_scores = []
+
+        for p_idx, prompt_text in enumerate(prompts):
+            t_p = time.time()
+            with torch.inference_mode():
+                result = processor.set_text_prompt(prompt=prompt_text, state=state)
+
+            masks_logits = result["masks_logits"]  # [N, 1, H, W] float
+            boxes = result["boxes"]                 # [N, 4] xyxy
+            scores = result["scores"]               # [N]
+
+            n = scores.shape[0] if scores.ndim > 0 else (1 if scores.numel() > 0 else 0)
+            logger.info("  Prompt %d/%d '%s': %d detections (%.2fs)",
+                        p_idx + 1, len(prompts), prompt_text, n, time.time() - t_p)
+
+            if n > 0:
+                logits_cpu = masks_logits.squeeze(1).cpu()  # [N, H, W]
+                boxes_cpu = boxes.cpu()
+                scores_cpu = scores.cpu()
+                if logits_cpu.ndim == 2:
+                    logits_cpu = logits_cpu.unsqueeze(0)
+                if boxes_cpu.ndim == 1:
+                    boxes_cpu = boxes_cpu.unsqueeze(0)
+                if scores_cpu.ndim == 0:
+                    scores_cpu = scores_cpu.unsqueeze(0)
+
+                for i in range(n):
+                    all_logits.append(logits_cpu[i])
+                    all_boxes.append(boxes_cpu[i])
+                    all_scores.append(scores_cpu[i])
+                    logger.debug("    det %d: score=%.3f", i, scores_cpu[i].item())
+
+            processor.reset_all_prompts(state)
+
+        return all_logits, all_boxes, all_scores
+
+    # ----- main -----------------------------------------------------------
+
     def segment(
         self,
         sam3_model: dict,
         image: torch.Tensor,
-        prompt_preset: str,
-        custom_prompt: str,
         score_threshold: float,
+        nms_iou_threshold: float,
+        min_solidity: float,
+        min_area_pct: float,
+        max_area_pct: float,
         max_detections: int,
         mask_expansion: int,
+        enable_sahi: bool,
+        sahi_tile_size: int,
+        sahi_overlap: float,
+        morph_close_size: int,
         keep_model_loaded: bool,
-        multi_prompt: str = "",
+        multi_prompt: str = "diamond",
     ):
         t0 = time.time()
-
         model = sam3_model["model"]
         device = sam3_model["device"]
         dtype = sam3_model["dtype"]
@@ -282,144 +332,206 @@ class SAM3GemstoneSegmentation:
         logger.info("Image shape: %s  dtype: %s", image.shape, image.dtype)
         logger.info("=" * 60)
 
-        # --- Resolve prompts ---
-        prompts: list[str] = []
-        if multi_prompt.strip():
-            prompts = [p.strip() for p in multi_prompt.strip().splitlines() if p.strip()]
-        elif prompt_preset == "custom":
-            prompts = [custom_prompt.strip() or "gemstone"]
-        else:
-            prompts = [prompt_preset]
-
+        # Resolve prompts
+        prompts = [p.strip() for p in multi_prompt.strip().splitlines() if p.strip()]
+        if not prompts:
+            prompts = ["diamond"]
         logger.info("Prompts (%d): %s", len(prompts), prompts)
 
-        # --- Ensure model on CUDA ---
-        model.to(device)
-
+        # Build processor with LOW threshold — we filter ourselves
         from sam3.model.sam3_image_processor import Sam3Processor
-        processor = Sam3Processor(model)
+        processor = Sam3Processor(model, confidence_threshold=0.01)
 
+        model.to(device)
         B, H, W, C = image.shape
-        logger.info("Batch=%d  H=%d  W=%d  C=%d", B, H, W, C)
+        logger.info("Batch=%d  H=%d  W=%d", B, H, W)
 
-        all_masks = []
-        all_overlays = []
-        all_cropped = []
+        all_masks_out = []
+        all_overlays_out = []
+        all_cropped_out = []
 
         for b_idx in range(B):
             t_batch = time.time()
             logger.info("--- Batch %d/%d ---", b_idx + 1, B)
 
+            # 1. PIL conversion
             np_img = (image[b_idx].cpu().numpy() * 255).astype(np.uint8)
             pil_img = Image.fromarray(np_img)
-            logger.debug("PIL image: %s  mode=%s", pil_img.size, pil_img.mode)
 
-            # --- set_image ---
+            # 2. set_image — cache vision features
             t_si = time.time()
             state = processor.set_image(pil_img)
             logger.info("set_image: %.2fs", time.time() - t_si)
-            logger.debug("state type: %s  keys: %s", type(state).__name__,
-                         list(state.keys()) if isinstance(state, dict) else "N/A")
 
-            combined_mask = torch.zeros((H, W), dtype=torch.float32, device="cpu")
+            # 3. Multi-prompt on full image
+            logger.info("[Full-frame] Running %d prompts...", len(prompts))
+            all_logits, all_boxes, all_scores = self._run_prompts(processor, state, prompts)
+            logger.info("[Full-frame] Total detections: %d", len(all_scores))
 
-            for p_idx, prompt_text in enumerate(prompts):
-                t_prompt = time.time()
-                logger.info("  Prompt %d/%d: '%s'", p_idx + 1, len(prompts), prompt_text)
+            # 4. SAHI tiling (optional, for large images)
+            need_sahi = enable_sahi and max(H, W) > sahi_tile_size * 2
+            if need_sahi:
+                tiles = self._get_tiles(H, W, sahi_tile_size, sahi_overlap)
+                logger.info("[SAHI] Image %dx%d > threshold, using %d tiles (%dx%d, overlap=%.1f)",
+                            W, H, len(tiles), sahi_tile_size, sahi_tile_size, sahi_overlap)
 
-                with torch.inference_mode():
-                    output = processor.set_text_prompt(state=state, prompt=prompt_text)
+                for t_idx, (tx1, ty1, tx2, ty2) in enumerate(tiles):
+                    tile_np = np_img[ty1:ty2, tx1:tx2]
+                    tile_pil = Image.fromarray(tile_np)
+                    tile_h, tile_w = ty2 - ty1, tx2 - tx1
 
-                logger.debug("  output keys: %s", list(output.keys()))
+                    tile_state = processor.set_image(tile_pil)
+                    t_logits, t_boxes, t_scores = self._run_prompts(processor, tile_state, prompts)
 
-                masks_raw = output["masks"]
-                scores_raw = output["scores"]
+                    # Remap to full image coords
+                    for i in range(len(t_scores)):
+                        # Box remap
+                        box = t_boxes[i].clone()
+                        box[0] += tx1
+                        box[1] += ty1
+                        box[2] += tx1
+                        box[3] += ty1
+                        all_boxes.append(box)
+                        all_scores.append(t_scores[i])
 
-                logger.debug("  masks type=%s  scores type=%s",
-                             type(masks_raw).__name__, type(scores_raw).__name__)
+                        # Mask remap — pad tile logit into full image
+                        full_logit = torch.zeros(H, W, dtype=torch.float32)
+                        tile_logit = t_logits[i]
+                        # tile_logit is [tile_h, tile_w] — might differ slightly due to processor resize
+                        if tile_logit.shape[0] != tile_h or tile_logit.shape[1] != tile_w:
+                            tile_logit = torch.nn.functional.interpolate(
+                                tile_logit.unsqueeze(0).unsqueeze(0),
+                                size=(tile_h, tile_w), mode="bilinear", align_corners=False,
+                            ).squeeze(0).squeeze(0)
+                        full_logit[ty1:ty2, tx1:tx2] = tile_logit
+                        all_logits.append(full_logit)
 
-                # --- Convert masks ---
-                if isinstance(masks_raw, torch.Tensor):
-                    masks_t = masks_raw.cpu().float()
-                    logger.debug("  masks tensor shape: %s", masks_t.shape)
+                    if (t_idx + 1) % 5 == 0:
+                        logger.info("[SAHI] Tile %d/%d done", t_idx + 1, len(tiles))
+
+                logger.info("[SAHI] Total detections after tiling: %d", len(all_scores))
+
+            # 5. NMS deduplication
+            if len(all_scores) == 0:
+                logger.warning("No detections at all!")
+                unified_mask = torch.zeros(H, W, dtype=torch.float32)
+            else:
+                boxes_t = torch.stack(all_boxes).to(device)
+                scores_t = torch.stack(all_scores).to(device)
+
+                # Filter by score_threshold first
+                above = scores_t >= score_threshold
+                indices_above = above.nonzero(as_tuple=True)[0]
+                logger.info("[Filter] Score >= %.2f: %d / %d",
+                            score_threshold, len(indices_above), len(scores_t))
+
+                if len(indices_above) == 0:
+                    logger.warning("All detections below score threshold!")
+                    unified_mask = torch.zeros(H, W, dtype=torch.float32)
                 else:
-                    masks_t = torch.as_tensor(np.array(masks_raw), dtype=torch.float32)
-                    logger.debug("  masks converted from list, shape: %s", masks_t.shape)
+                    boxes_filtered = boxes_t[indices_above]
+                    scores_filtered = scores_t[indices_above]
 
-                if isinstance(scores_raw, torch.Tensor):
-                    scores_t = scores_raw.cpu().float()
-                else:
-                    scores_t = torch.as_tensor(np.array(scores_raw), dtype=torch.float32)
+                    keep_nms = nms(boxes_filtered, scores_filtered, nms_iou_threshold)
+                    kept_global = indices_above[keep_nms].cpu()
+                    logger.info("[NMS] iou=%.2f: %d -> %d detections",
+                                nms_iou_threshold, len(indices_above), len(keep_nms))
 
-                logger.debug("  scores: %s", scores_t)
+                    # 6. Quality filtering
+                    image_area = H * W
+                    surviving = []
+                    for rank, gi in enumerate(kept_global):
+                        gi = gi.item()
+                        logit = all_logits[gi]
+                        binary_np = (logit.numpy() > 0.5).astype(np.uint8)
+                        mask_area = binary_np.sum()
+                        area_pct = mask_area / image_area * 100
+                        score_val = all_scores[gi].item()
 
-                if masks_t.ndim == 2:
-                    masks_t = masks_t.unsqueeze(0)
-                    scores_t = scores_t.unsqueeze(0) if scores_t.ndim == 0 else scores_t
+                        # Area filter
+                        if area_pct < min_area_pct:
+                            logger.debug("    [SKIP] det %d: area %.4f%% < min %.4f%%",
+                                         gi, area_pct, min_area_pct)
+                            continue
+                        if area_pct > max_area_pct:
+                            logger.debug("    [SKIP] det %d: area %.1f%% > max %.1f%%",
+                                         gi, area_pct, max_area_pct)
+                            continue
 
-                # --- Filter ---
-                keep_idx = (scores_t >= score_threshold).nonzero(as_tuple=True)[0]
-                logger.info("  Total detections: %d  Above threshold (%.2f): %d",
-                            masks_t.shape[0], score_threshold, len(keep_idx))
+                        # Solidity filter
+                        if min_solidity > 0 and not self._check_solidity(binary_np, min_solidity):
+                            logger.debug("    [SKIP] det %d: solidity below %.2f", gi, min_solidity)
+                            continue
 
-                if len(keep_idx) > max_detections:
-                    top_scores, top_idx = scores_t[keep_idx].topk(max_detections)
-                    keep_idx = keep_idx[top_idx]
-                    logger.info("  Clamped to max_detections=%d", max_detections)
+                        surviving.append(gi)
+                        logger.debug("    [KEEP] det %d: score=%.3f area=%.3f%%",
+                                     gi, score_val, area_pct)
 
-                for i, idx in enumerate(keep_idx):
-                    m = masks_t[idx]
-                    score_val = scores_t[idx].item()
-                    logger.debug("    det %d: score=%.3f  mask shape=%s  min=%.3f max=%.3f",
-                                 i, score_val, m.shape, m.min().item(), m.max().item())
-                    if m.shape != (H, W):
-                        logger.debug("    resizing mask %s -> (%d, %d)", m.shape, H, W)
-                        m = torch.nn.functional.interpolate(
-                            m.unsqueeze(0).unsqueeze(0), size=(H, W),
-                            mode="bilinear", align_corners=False,
-                        ).squeeze(0).squeeze(0)
-                    if mask_expansion != 0:
-                        m = self._expand_mask(m, mask_expansion)
-                    combined_mask = torch.max(combined_mask, m)
+                    logger.info("[Quality] %d -> %d detections after area+solidity",
+                                len(keep_nms), len(surviving))
 
-                logger.info("  Prompt done: %.2fs", time.time() - t_prompt)
+                    # 7. Top-K
+                    if len(surviving) > max_detections:
+                        surv_scores = torch.tensor([all_scores[i].item() for i in surviving])
+                        _, topk_idx = surv_scores.topk(max_detections)
+                        surviving = [surviving[i] for i in topk_idx]
+                        logger.info("[Top-K] Clamped to %d detections", max_detections)
 
-            combined_mask = combined_mask.clamp(0, 1)
-            mask_coverage = (combined_mask > 0.5).float().mean().item() * 100
-            logger.info("  Combined mask coverage: %.1f%%", mask_coverage)
+                    # 8. Soft max-union merge
+                    if len(surviving) == 0:
+                        logger.warning("No detections survived filtering!")
+                        unified_mask = torch.zeros(H, W, dtype=torch.float32)
+                    else:
+                        unified_logits = torch.zeros(H, W, dtype=torch.float32)
+                        for gi in surviving:
+                            logit = all_logits[gi]  # [H, W] float [0, 1]
+                            unified_logits = torch.max(unified_logits, logit)
+                        unified_mask = (unified_logits > 0.5).float()
+                        coverage = unified_mask.mean().item() * 100
+                        logger.info("[Merge] %d masks merged, coverage: %.1f%%",
+                                    len(surviving), coverage)
 
-            # --- Overlay ---
+            # 9. Mask expansion
+            if mask_expansion != 0 and unified_mask.sum() > 0:
+                unified_mask = self._expand_mask(unified_mask, mask_expansion)
+
+            # 10. Morphological closing
+            if morph_close_size > 0 and unified_mask.sum() > 0:
+                unified_mask = self._morph_close(unified_mask, morph_close_size)
+
+            # 11. Generate outputs
             img_tensor = image[b_idx].cpu().clone()
+            mask_3d = unified_mask.unsqueeze(-1)
+
+            # Overlay: green tint on detected regions
             overlay = img_tensor.clone()
             gem_color = torch.tensor([0.0, 1.0, 0.3], dtype=torch.float32)
             alpha = 0.35
-            mask_3d = combined_mask.unsqueeze(-1)
             overlay = overlay * (1 - mask_3d * alpha) + gem_color * mask_3d * alpha
             overlay = overlay.clamp(0, 1)
 
-            # --- Cropped ---
-            cropped_rgb = img_tensor * mask_3d + (1 - mask_3d) * 1.0
-            cropped_rgb = cropped_rgb.clamp(0, 1)
+            # Cropped: gems on white background
+            cropped = img_tensor * mask_3d + (1 - mask_3d) * 1.0
+            cropped = cropped.clamp(0, 1)
 
-            all_masks.append(combined_mask)
-            all_overlays.append(overlay)
-            all_cropped.append(cropped_rgb)
+            all_masks_out.append(unified_mask)
+            all_overlays_out.append(overlay)
+            all_cropped_out.append(cropped)
 
-            logger.info("  Batch %d done: %.2fs", b_idx + 1, time.time() - t_batch)
+            logger.info("Batch %d done: %.2fs", b_idx + 1, time.time() - t_batch)
 
-        # --- Offload ---
+        # Offload
         if not keep_model_loaded:
             logger.info("Offloading model from GPU...")
             model.to(mm.unet_offload_device())
             mm.soft_empty_cache()
 
-        mask_batch = torch.stack(all_masks, dim=0)
-        overlay_batch = torch.stack(all_overlays, dim=0)
-        cropped_batch = torch.stack(all_cropped, dim=0)
+        mask_batch = torch.stack(all_masks_out, dim=0)
+        overlay_batch = torch.stack(all_overlays_out, dim=0)
+        cropped_batch = torch.stack(all_cropped_out, dim=0)
 
-        elapsed = time.time() - t0
-        logger.info("SEGMENT DONE in %.1fs  output shapes: overlay=%s mask=%s cropped=%s",
-                    elapsed, overlay_batch.shape, mask_batch.shape, cropped_batch.shape)
+        logger.info("SEGMENT DONE in %.1fs  shapes: overlay=%s mask=%s cropped=%s",
+                    time.time() - t0, overlay_batch.shape, mask_batch.shape, cropped_batch.shape)
 
         return (overlay_batch, mask_batch, cropped_batch)
 
@@ -501,9 +613,8 @@ class SAM3GemstoneMaskPostProcess:
 
     def process(self, mask: torch.Tensor, smooth_radius: int,
                 binary_threshold: float, expand_pixels: int, invert: bool):
-        logger.info("MaskPostProcess: input shape=%s  smooth=%d  thresh=%.2f  expand=%d  invert=%s",
+        logger.info("MaskPostProcess: shape=%s smooth=%d thresh=%.2f expand=%d invert=%s",
                     mask.shape, smooth_radius, binary_threshold, expand_pixels, invert)
-
         result = mask.clone().float()
 
         if smooth_radius > 0:
@@ -514,7 +625,6 @@ class SAM3GemstoneMaskPostProcess:
             kernel_1d = kernel_1d / kernel_1d.sum()
             kernel_2d = kernel_1d.unsqueeze(1) @ kernel_1d.unsqueeze(0)
             kernel_2d = kernel_2d.unsqueeze(0).unsqueeze(0)
-
             pad = smooth_radius
             for b in range(result.shape[0]):
                 m = result[b].unsqueeze(0).unsqueeze(0)
@@ -524,23 +634,21 @@ class SAM3GemstoneMaskPostProcess:
 
         if binary_threshold > 0:
             result = (result >= binary_threshold).float()
-
         if expand_pixels != 0:
             for b in range(result.shape[0]):
                 result[b] = SAM3GemstoneSegmentation._expand_mask(result[b], expand_pixels)
-
         if invert:
             result = 1.0 - result
 
-        logger.info("MaskPostProcess done: output shape=%s", result.shape)
+        logger.info("MaskPostProcess done: shape=%s", result.shape)
         return (result.clamp(0, 1),)
 
 
 # ============================================================================
-#  5.  BATCH STATS NODE
+#  5.  STATS NODE
 # ============================================================================
 class SAM3GemstoneStats:
-    """Output basic statistics about detected gemstones."""
+    """Output statistics about detected gemstones."""
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -560,24 +668,22 @@ class SAM3GemstoneStats:
     def compute(self, mask: torch.Tensor, image: torch.Tensor):
         B, H, W = mask.shape
         total_pixels = H * W
-        logger.info("Stats: B=%d  H=%d  W=%d", B, H, W)
+        logger.info("Stats: B=%d H=%d W=%d", B, H, W)
 
         lines = []
         total_gems = 0
         total_coverage = 0.0
 
         for b in range(B):
-            m = mask[b]
-            binary = (m > 0.5).float()
-            coverage = binary.sum().item() / total_pixels * 100
-
-            labeled = self._label_components(binary)
-            n_gems = int(labeled.max().item())
+            binary = (mask[b] > 0.5).cpu().numpy().astype(np.uint8)
+            coverage = binary.sum() / total_pixels * 100
+            num_labels, _ = cv2.connectedComponents(binary, connectivity=4)
+            n_gems = num_labels - 1  # subtract background label
 
             total_gems += n_gems
             total_coverage += coverage
 
-            line = f"[Batch {b}] Gems: {n_gems} | Coverage: {coverage:.1f}% | Resolution: {W}x{H}"
+            line = f"[Batch {b}] Gems: {n_gems} | Coverage: {coverage:.1f}% | {W}x{H}"
             logger.info("  %s", line)
             lines.append(line)
 
@@ -586,27 +692,6 @@ class SAM3GemstoneStats:
         lines.append(f"Total gems: {total_gems} | Avg coverage: {avg_coverage:.1f}%")
 
         return ("\n".join(lines), total_gems, round(avg_coverage, 2))
-
-    @staticmethod
-    def _label_components(binary: torch.Tensor) -> torch.Tensor:
-        arr = binary.cpu().numpy().astype(np.uint8)
-        H, W = arr.shape
-        labels = np.zeros_like(arr, dtype=np.int32)
-        label_id = 0
-        for y in range(H):
-            for x in range(W):
-                if arr[y, x] == 1 and labels[y, x] == 0:
-                    label_id += 1
-                    stack = [(y, x)]
-                    while stack:
-                        cy, cx = stack.pop()
-                        if cy < 0 or cy >= H or cx < 0 or cx >= W:
-                            continue
-                        if arr[cy, cx] == 0 or labels[cy, cx] != 0:
-                            continue
-                        labels[cy, cx] = label_id
-                        stack.extend([(cy-1, cx), (cy+1, cx), (cy, cx-1), (cy, cx+1)])
-        return torch.from_numpy(labels)
 
 
 # ============================================================================

@@ -2,7 +2,6 @@
 
 import subprocess
 import sys
-import os
 
 
 def pip_install(*args):
@@ -20,10 +19,16 @@ def main():
         pip_install("--no-deps", "sam3>=0.1.2")
 
     try:
-        import huggingface_hub  # noqa: F401
+        import cv2  # noqa: F401
     except ImportError:
-        print("[SAM3-Gemstone] Installing huggingface_hub...")
-        pip_install("huggingface_hub>=0.20.0")
+        print("[SAM3-Gemstone] Installing opencv-python-headless...")
+        pip_install("opencv-python-headless>=4.8.0")
+
+    try:
+        from torchvision.ops import nms  # noqa: F401
+    except ImportError:
+        print("[SAM3-Gemstone] torchvision not found (needed for NMS). Installing...")
+        pip_install("torchvision")
 
     print("[SAM3-Gemstone] Dependencies OK.")
 

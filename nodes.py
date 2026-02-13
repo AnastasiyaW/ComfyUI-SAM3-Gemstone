@@ -8,6 +8,7 @@ import cv2
 from PIL import Image
 
 import comfy.model_management as mm
+import comfy.model_patcher
 import folder_paths
 from torchvision.ops import nms
 
@@ -35,6 +36,7 @@ os.makedirs(ZIM_MODEL_DIR, exist_ok=True)
 ZIM_BACKBONE = "vit_b"
 ZIM_CKPT_SUBDIR = "zim_vit_b_2043"
 
+# Cache: stores {"patcher": ModelPatcher, "processor": Sam3Processor}
 _sam3_cache: dict = {}
 _zim_cache: dict = {}
 
@@ -84,13 +86,43 @@ def _load_zim_model():
     return predictor
 
 
+# ---------------------------------------------------------------------------
+# Shared helper: build edge band for ZIM refinement
+# ---------------------------------------------------------------------------
+def _build_edge_band(obj_mask_u8, band_inner, band_outer):
+    """Build a soft edge band around the contour of obj_mask.
+
+    Returns float32 mask where:
+    - interior (far from edge) = 0  (keep original mask)
+    - edge band = 1  (replace with ZIM alpha)
+    - exterior (far from edge) = 0
+    """
+    kern_outer = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE, (band_outer * 2 + 1, band_outer * 2 + 1)
+    )
+    kern_inner = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE, (band_inner * 2 + 1, band_inner * 2 + 1)
+    )
+
+    dilated = cv2.dilate(obj_mask_u8, kern_outer, iterations=1)
+    eroded = cv2.erode(obj_mask_u8, kern_inner, iterations=1)
+
+    band = np.clip(dilated.astype(np.float32) - eroded.astype(np.float32), 0, 1)
+
+    blur_size = max(3, (band_outer + band_inner) | 1)
+    band = cv2.GaussianBlur(band, (blur_size, blur_size), 0)
+
+    return band
+
+
 # ============================================================================
 #  SINGLE NODE — SAM3 Gemstone Segmentation
 # ============================================================================
 class SAM3Gemstone:
     """All-in-one SAM3 gemstone segmentation node.
-    Loads model (cached), segments gemstones, optionally refines edges with ZIM,
-    outputs mask + overlay + stats."""
+    Loads model (cached via ModelPatcher), segments gemstones,
+    optionally refines edges with ZIM, outputs mask + overlay + stats.
+    ComfyUI auto-offloads SAM3 when other models need VRAM."""
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -141,7 +173,6 @@ class SAM3Gemstone:
                     "default": 3, "min": 0, "max": 15, "step": 2,
                 }),
                 "use_zim_refinement": ("BOOLEAN", {"default": False}),
-                "keep_model_loaded": ("BOOLEAN", {"default": True}),
                 "compile_model": ("BOOLEAN", {"default": False}),
             },
         }
@@ -153,14 +184,15 @@ class SAM3Gemstone:
     OUTPUT_NODE = True
 
     # =====================================================================
-    #  SAM3 Model loading (cached)
+    #  SAM3 Model loading — returns ModelPatcher + processor
     # =====================================================================
     def _load_model(self, compile_model: bool):
         t0 = time.time()
         device = mm.get_torch_device()
+        offload_device = mm.unet_offload_device()
 
         logger.info("=" * 60)
-        logger.info("LOAD START  device=%s  compile=%s", device, compile_model)
+        logger.info("LOAD START  device=%s  offload=%s  compile=%s", device, offload_device, compile_model)
 
         if device.type != "cuda":
             raise RuntimeError(
@@ -212,27 +244,31 @@ class SAM3Gemstone:
             )
         logger.info("BPE tokenizer: %s", bpe_path)
 
-        # Build model
+        # Build model — initially on CPU for ModelPatcher flow
         logger.info("Building SAM3 image model...")
         from sam3.model_builder import build_sam3_image_model
 
         model = build_sam3_image_model(
             bpe_path=bpe_path,
-            device=str(device),
+            device="cpu",
             checkpoint_path=ckpt_path,
             load_from_HF=False,
             compile=compile_model,
         )
-        logger.info("Model built. Moving to device=%s fp32...", device)
-        model = model.to(device=device, dtype=torch.float32)
+        model = model.to(dtype=torch.float32)
         model.eval()
+        logger.info("Model built on CPU, wrapping in ModelPatcher...")
 
-        first_param = next(model.parameters())
-        logger.info("Model param check: device=%s  dtype=%s", first_param.device, first_param.dtype)
-        if not first_param.is_cuda:
-            raise RuntimeError(f"Model on {first_param.device}, expected CUDA.")
+        # Wrap in ModelPatcher — ComfyUI manages GPU offload
+        patcher = comfy.model_patcher.ModelPatcher(
+            model,
+            load_device=device,
+            offload_device=offload_device,
+        )
+        logger.info("ModelPatcher created: size=%.1f MB, load=%s, offload=%s",
+                    patcher.model_size() / (1024 ** 2), device, offload_device)
 
-        # Build and cache processor + monkey-patch
+        # Build processor + monkey-patch (processor references model, works on whatever device model is on)
         from sam3.model.sam3_image_processor import Sam3Processor
         from sam3.model.box_ops import box_cxcywh_to_xyxy
         from torch.nn.functional import interpolate as F_interpolate
@@ -282,7 +318,7 @@ class SAM3Gemstone:
         processor._forward_grounding = types.MethodType(_forward_grounding_no_presence, processor)
         logger.info("Patched Sam3Processor: presence_logit_dec multiplier DISABLED")
 
-        pipe = {"model": model, "device": device, "processor": processor}
+        pipe = {"patcher": patcher, "processor": processor}
         _sam3_cache[cache_key] = pipe
 
         logger.info("LOAD DONE in %.1fs", time.time() - t0)
@@ -327,29 +363,18 @@ class SAM3Gemstone:
                 masks, scores, _ = zim_predictor.predict(box=bbox_np, multimask_output=False)
                 zim_alpha = masks[0].astype(np.float32)
 
-                # Get SAM3 mask as base
                 sam3_mask = all_logits[gi]
                 if isinstance(sam3_mask, torch.Tensor):
                     sam3_np = (sam3_mask.numpy() > 0.5).astype(np.uint8)
                 else:
                     sam3_np = (sam3_mask > 0.5).astype(np.uint8) if isinstance(sam3_mask, np.ndarray) else np.zeros((H, W), dtype=np.uint8)
 
-                # Check ZIM coverage
                 obj_coverage = (zim_alpha * sam3_np).sum() / max(sam3_np.sum(), 1)
                 if obj_coverage < ZIM_MIN_COVERAGE:
                     logger.debug("  [ZIM] det %d: coverage %.1f%% → FALLBACK to SAM3", gi, obj_coverage * 100)
                     continue
 
-                # Build edge band: smooth transition around SAM3 mask contour
-                kern_outer = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (BAND_OUTER * 2 + 1, BAND_OUTER * 2 + 1))
-                kern_inner = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (BAND_INNER * 2 + 1, BAND_INNER * 2 + 1))
-                dilated = cv2.dilate(sam3_np, kern_outer, iterations=1)
-                eroded = cv2.erode(sam3_np, kern_inner, iterations=1)
-                edge_band = np.clip(dilated.astype(np.float32) - eroded.astype(np.float32), 0, 1)
-                blur_sz = max(3, (BAND_OUTER + BAND_INNER) | 1)
-                edge_band = cv2.GaussianBlur(edge_band, (blur_sz, blur_sz), 0)
-
-                # Blend: interior = SAM3, edge band = ZIM, exterior = 0
+                edge_band = _build_edge_band(sam3_np, BAND_INNER, BAND_OUTER)
                 base = sam3_np.astype(np.float32)
                 blended = base * (1.0 - edge_band) + zim_alpha * edge_band
                 refined_logits[gi] = torch.from_numpy(np.maximum(base, blended).clip(0, 1))
@@ -383,7 +408,6 @@ class SAM3Gemstone:
                 full_zim = np.zeros((H, W), dtype=np.float32)
                 full_zim[y1:y2, x1:x2] = masks[0].astype(np.float32)
 
-                # SAM3 base mask
                 sam3_mask = all_logits[gi]
                 if isinstance(sam3_mask, torch.Tensor):
                     sam3_np = (sam3_mask.numpy() > 0.5).astype(np.uint8)
@@ -395,14 +419,7 @@ class SAM3Gemstone:
                     logger.debug("  [ZIM] large det %d: coverage %.1f%% → FALLBACK", gi, obj_coverage * 100)
                     continue
 
-                kern_outer = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (BAND_OUTER * 2 + 1, BAND_OUTER * 2 + 1))
-                kern_inner = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (BAND_INNER * 2 + 1, BAND_INNER * 2 + 1))
-                dilated = cv2.dilate(sam3_np, kern_outer, iterations=1)
-                eroded = cv2.erode(sam3_np, kern_inner, iterations=1)
-                edge_band = np.clip(dilated.astype(np.float32) - eroded.astype(np.float32), 0, 1)
-                blur_sz = max(3, (BAND_OUTER + BAND_INNER) | 1)
-                edge_band = cv2.GaussianBlur(edge_band, (blur_sz, blur_sz), 0)
-
+                edge_band = _build_edge_band(sam3_np, BAND_INNER, BAND_OUTER)
                 base = sam3_np.astype(np.float32)
                 blended = base * (1.0 - edge_band) + full_zim * edge_band
                 refined_logits[gi] = torch.from_numpy(np.maximum(base, blended).clip(0, 1))
@@ -537,24 +554,23 @@ class SAM3Gemstone:
         sahi_overlap: float,
         morph_close_size: int,
         use_zim_refinement: bool,
-        keep_model_loaded: bool,
         compile_model: bool,
     ):
         t0 = time.time()
 
-        # --- Free VRAM from other models (Flux, CLIP, VAE, etc.) ---
-        logger.info("Requesting VRAM cleanup before SAM3...")
-        mm.soft_empty_cache()
-
         # --- Load / get cached model + processor ---
         pipe = self._load_model(compile_model)
-        model = pipe["model"]
-        device = pipe["device"]
+        patcher = pipe["patcher"]
         processor = pipe["processor"]
 
-        # Ensure model is on GPU (no-op if already there)
-        if not next(model.parameters()).is_cuda:
-            model.to(device)
+        # Tell ComfyUI to load SAM3 to GPU (auto-evicts Flux/CLIP/VAE if needed)
+        logger.info("Requesting ComfyUI to load SAM3 model to GPU...")
+        mm.load_model_gpu(patcher)
+        device = patcher.load_device
+        logger.info("SAM3 model on GPU (device=%s)", device)
+
+        # Update processor device reference (model may have moved)
+        processor.device = device
 
         # --- Load ZIM if requested ---
         zim_predictor = None
@@ -626,11 +642,10 @@ class SAM3Gemstone:
                 logger.info("Batch %d done: %.2fs", b_idx + 1, time.time() - t_batch)
 
         finally:
-            # Cleanup on success or error
-            if not keep_model_loaded:
-                logger.info("Offloading model from GPU...")
-                model.to(mm.unet_offload_device())
-                mm.soft_empty_cache()
+            # ComfyUI manages offload via ModelPatcher — no manual cleanup needed
+            # Just clear CUDA cache to free fragmented memory
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
         mask_batch = torch.stack(all_masks_out, dim=0)
         overlay_batch = torch.stack(all_overlays_out, dim=0)
@@ -672,7 +687,6 @@ class SAM3Gemstone:
             logger.info("[Full-frame] Running %d prompts...", len(prompts))
             all_logits, all_boxes, all_scores = self._run_prompts(processor, state, prompts)
             logger.info("[Full-frame] Total detections: %d", len(all_scores))
-            # Free full-frame backbone features
             del state
         else:
             logger.info("[SAHI] force_sahi=True, SKIPPING full-frame pass (saves VRAM)")
@@ -691,10 +705,8 @@ class SAM3Gemstone:
                 tile_state = processor.set_image(tile_pil)
                 t_logits, t_boxes, t_scores = self._run_prompts(processor, tile_state, prompts)
 
-                # Free tile backbone features immediately
                 del tile_state
 
-                # Remap to full image coords
                 for i in range(len(t_scores)):
                     box = t_boxes[i].clone()
                     box[0] += tx1
@@ -704,20 +716,17 @@ class SAM3Gemstone:
                     all_boxes.append(box)
                     all_scores.append(t_scores[i])
 
-                    # Store compact: (tile_logit, tile_coords) — expand later
                     tile_logit = t_logits[i]
                     if tile_logit.shape[0] != tile_h or tile_logit.shape[1] != tile_w:
                         tile_logit = torch.nn.functional.interpolate(
                             tile_logit.unsqueeze(0).unsqueeze(0),
                             size=(tile_h, tile_w), mode="bilinear", align_corners=False,
                         ).squeeze(0).squeeze(0)
-                    # Store as (logit, region) to avoid HxW allocation per detection
                     all_logits.append((tile_logit, tx1, ty1, tx2, ty2))
 
                 if (t_idx + 1) % 5 == 0:
                     logger.info("[SAHI] Tile %d/%d done", t_idx + 1, len(tiles))
 
-            # Periodic CUDA cache cleanup during tiling
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
@@ -731,7 +740,6 @@ class SAM3Gemstone:
         boxes_t = torch.stack(all_boxes)
         scores_t = torch.stack(all_scores)
 
-        # NMS on CPU to avoid GPU transfer overhead for small tensors
         above = scores_t >= score_threshold
         indices_above = above.nonzero(as_tuple=True)[0]
         logger.info("[Filter] Score >= %.2f: %d / %d",
@@ -744,7 +752,6 @@ class SAM3Gemstone:
         boxes_filtered = boxes_t[indices_above]
         scores_filtered = scores_t[indices_above]
 
-        # NMS on GPU (torchvision nms is faster on CUDA)
         keep_nms = nms(boxes_filtered.to(device), scores_filtered.to(device), nms_iou_threshold)
         kept_global = indices_above[keep_nms.cpu()].cpu()
         logger.info("[NMS] iou=%.2f: %d -> %d detections",
@@ -787,7 +794,6 @@ class SAM3Gemstone:
         # ZIM refinement
         if zim_predictor is not None and len(surviving) > 0:
             try:
-                # Need full-size logits for ZIM
                 for gi in surviving:
                     all_logits[gi] = self._expand_logit(all_logits[gi], H, W)
                 refined = self._refine_with_zim(
@@ -809,10 +815,7 @@ class SAM3Gemstone:
             logit = self._expand_logit(all_logits[gi], H, W)
             unified_logits = torch.max(unified_logits, logit)
 
-        # If ZIM refined: logits are already 0-1 alpha with soft edges → keep them
-        # If raw SAM3: logits are raw sigmoid values → binarize at 0.5
         if zim_predictor is not None:
-            # Clamp to valid range but preserve soft edges from ZIM
             unified_mask = unified_logits.clamp(0, 1)
         else:
             unified_mask = (unified_logits > 0.5).float()
@@ -844,7 +847,10 @@ class SAM3Gemstone:
 #  STANDALONE NODE — ZIM Refine Mask
 # ============================================================================
 class ZIMRefineMask:
-    """Takes an image and a rough mask, refines edges using ZIM alpha matting."""
+    """Takes an image and a rough mask, refines edges using ZIM alpha matting.
+    Original mask is the BASE (interior always filled).
+    ZIM only replaces pixels in the edge band around each object contour.
+    If ZIM can't find the object → fallback to original mask edges."""
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -853,16 +859,28 @@ class ZIMRefineMask:
                 "image": ("IMAGE",),
                 "mask": ("MASK",),
                 "min_object_area": ("INT", {
-                    "default": 100, "min": 10, "max": 100000, "step": 10,
-                    "tooltip": "Minimum object area in pixels to refine (skip tiny noise)",
+                    "default": 20, "min": 5, "max": 100000, "step": 5,
+                    "tooltip": "Min object area in pixels (skip tiny noise). Low = detect chain links.",
                 }),
                 "crop_padding": ("INT", {
                     "default": 30, "min": 0, "max": 200, "step": 5,
-                    "tooltip": "Pixels of padding around each object bbox for ZIM crop",
+                    "tooltip": "Pixels of padding around large object bbox for ZIM crop",
                 }),
                 "large_object_pct": ("FLOAT", {
                     "default": 5.0, "min": 1.0, "max": 50.0, "step": 1.0,
                     "tooltip": "Objects above this % of image area get individual crops",
+                }),
+                "band_inner": ("INT", {
+                    "default": 5, "min": 1, "max": 30, "step": 1,
+                    "tooltip": "Edge band width INSIDE the mask contour (pixels)",
+                }),
+                "band_outer": ("INT", {
+                    "default": 10, "min": 1, "max": 50, "step": 1,
+                    "tooltip": "Edge band width OUTSIDE the mask contour (pixels)",
+                }),
+                "zim_min_coverage": ("FLOAT", {
+                    "default": 0.10, "min": 0.0, "max": 1.0, "step": 0.05,
+                    "tooltip": "Min ZIM coverage within object to accept (0=always accept ZIM, 1=always fallback)",
                 }),
             },
         }
@@ -872,49 +890,15 @@ class ZIMRefineMask:
     FUNCTION = "run"
     CATEGORY = "SAM3-Gemstone"
 
-    @staticmethod
-    def _build_edge_band(obj_mask_u8, band_inner, band_outer):
-        """Build a soft edge band around the contour of obj_mask.
-
-        Returns float32 mask where:
-        - interior (far from edge) = 0  (keep original mask)
-        - edge band = 1  (replace with ZIM alpha)
-        - exterior (far from edge) = 0
-
-        The blend transitions smoothly via Gaussian blur.
-        """
-        kern_outer = cv2.getStructuringElement(
-            cv2.MORPH_ELLIPSE, (band_outer * 2 + 1, band_outer * 2 + 1)
-        )
-        kern_inner = cv2.getStructuringElement(
-            cv2.MORPH_ELLIPSE, (band_inner * 2 + 1, band_inner * 2 + 1)
-        )
-
-        dilated = cv2.dilate(obj_mask_u8, kern_outer, iterations=1)
-        eroded = cv2.erode(obj_mask_u8, kern_inner, iterations=1)
-
-        # Band = dilated minus eroded (ring around edge)
-        band = np.clip(dilated.astype(np.float32) - eroded.astype(np.float32), 0, 1)
-
-        # Smooth the band edges for soft blending
-        blur_size = max(3, (band_outer + band_inner) | 1)  # ensure odd
-        band = cv2.GaussianBlur(band, (blur_size, blur_size), 0)
-
-        return band
-
-    def run(self, image, mask, min_object_area, crop_padding, large_object_pct):
+    def run(self, image, mask, min_object_area, crop_padding, large_object_pct,
+            band_inner, band_outer, zim_min_coverage):
         t0 = time.time()
         B, H, W, C = image.shape
         logger.info("=" * 60)
-        logger.info("[ZIM-Refine] START  B=%d  H=%d  W=%d", B, H, W)
+        logger.info("[ZIM-Refine] START  B=%d  H=%d  W=%d  band=%d/%d  min_area=%d",
+                    B, H, W, band_inner, band_outer, min_object_area)
 
         predictor = _load_zim_model()
-
-        # Edge band widths — how many pixels around contour to refine
-        BAND_INNER = 5   # pixels inside the contour
-        BAND_OUTER = 10  # pixels outside the contour
-        # Minimum ZIM coverage within object to consider it a valid detection
-        ZIM_MIN_COVERAGE = 0.10
 
         all_masks_out = []
         all_overlays_out = []
@@ -942,11 +926,13 @@ class ZIMRefineMask:
             image_area = H * W
             small_objects = []
             large_objects = []
+            skipped_tiny = 0
 
             for label_id in range(1, num_labels):
                 ys, xs = np.where(labels == label_id)
                 obj_area = len(ys)
                 if obj_area < min_object_area:
+                    skipped_tiny += 1
                     continue
                 x1, y1 = int(xs.min()), int(ys.min())
                 x2, y2 = int(xs.max()) + 1, int(ys.max()) + 1
@@ -956,16 +942,14 @@ class ZIMRefineMask:
                 else:
                     small_objects.append((label_id, x1, y1, x2, y2))
 
-            logger.info("[ZIM-Refine] %d small + %d large (skipped %d tiny)",
-                        len(small_objects), len(large_objects),
-                        n_objects - len(small_objects) - len(large_objects))
+            logger.info("[ZIM-Refine] %d small + %d large (skipped %d tiny < %d px)",
+                        len(small_objects), len(large_objects), skipped_tiny, min_object_area)
 
-            # ---------------------------------------------------------------
-            # Strategy: original mask is the BASE (interior is always filled).
-            # ZIM only replaces pixels in the EDGE BAND around each object.
-            # If ZIM returns empty/bad alpha → fallback to original mask edges.
-            # ---------------------------------------------------------------
-            unified_alpha = mask_np.astype(np.float32)  # start from original mask
+            # Original mask = BASE (interior always filled)
+            unified_alpha = mask_np.astype(np.float32)
+
+            zim_refined = 0
+            zim_fallback = 0
 
             if small_objects:
                 t_small = time.time()
@@ -978,22 +962,18 @@ class ZIMRefineMask:
 
                     obj_mask_u8 = (labels == label_id).astype(np.uint8)
 
-                    # Check if ZIM found anything meaningful in this object area
                     obj_coverage = (zim_alpha * obj_mask_u8).sum() / max(obj_mask_u8.sum(), 1)
 
-                    if obj_coverage < ZIM_MIN_COVERAGE:
-                        # ZIM didn't find the object → keep original mask
-                        logger.debug("  [ZIM] obj %d: coverage %.1f%% < %.0f%% → FALLBACK",
-                                     label_id, obj_coverage * 100, ZIM_MIN_COVERAGE * 100)
+                    if obj_coverage < zim_min_coverage:
+                        zim_fallback += 1
+                        logger.debug("  [ZIM] obj %d: coverage %.1f%% → FALLBACK",
+                                     label_id, obj_coverage * 100)
                         continue
 
-                    # Build edge band and blend ZIM into it
-                    edge_band = self._build_edge_band(obj_mask_u8, BAND_INNER, BAND_OUTER)
-
-                    # In the edge band: use ZIM alpha
-                    # Outside edge band: keep what we have (original mask interior / background)
+                    edge_band = _build_edge_band(obj_mask_u8, band_inner, band_outer)
                     blended = unified_alpha * (1.0 - edge_band) + zim_alpha * edge_band
                     unified_alpha = np.maximum(unified_alpha, blended)
+                    zim_refined += 1
 
                     if (idx + 1) % 50 == 0:
                         logger.info("[ZIM-Refine] Small: %d/%d done", idx + 1, len(small_objects))
@@ -1016,27 +996,27 @@ class ZIMRefineMask:
 
                     crop_alpha = masks_out[0].astype(np.float32)
 
-                    # Map ZIM alpha back to full image
                     full_zim_alpha = np.zeros((H, W), dtype=np.float32)
                     full_zim_alpha[cy1:cy2, cx1:cx2] = crop_alpha
 
                     obj_mask_u8 = (labels == label_id).astype(np.uint8)
 
-                    # Check ZIM coverage
                     obj_coverage = (full_zim_alpha * obj_mask_u8).sum() / max(obj_mask_u8.sum(), 1)
 
-                    if obj_coverage < ZIM_MIN_COVERAGE:
+                    if obj_coverage < zim_min_coverage:
+                        zim_fallback += 1
                         logger.debug("  [ZIM] large obj %d: coverage %.1f%% → FALLBACK",
                                      label_id, obj_coverage * 100)
                         continue
 
-                    # Build edge band and blend
-                    edge_band = self._build_edge_band(obj_mask_u8, BAND_INNER, BAND_OUTER)
-
+                    edge_band = _build_edge_band(obj_mask_u8, band_inner, band_outer)
                     blended = unified_alpha * (1.0 - edge_band) + full_zim_alpha * edge_band
                     unified_alpha = np.maximum(unified_alpha, blended)
+                    zim_refined += 1
 
                 logger.info("[ZIM-Refine] %d large: %.2fs", len(large_objects), time.time() - t_large)
+
+            logger.info("[ZIM-Refine] Refined: %d, Fallback: %d", zim_refined, zim_fallback)
 
             refined_mask = torch.from_numpy(unified_alpha).clamp(0, 1)
 
@@ -1089,7 +1069,6 @@ class GemstoneInpaintCrop:
         t0 = time.time()
         B, H, W, C = image.shape
 
-        # Resolve mask to 2D
         if mask.ndim == 4:
             mask_2d = mask[0, :, :, 0]
         elif mask.ndim == 3:
@@ -1097,7 +1076,6 @@ class GemstoneInpaintCrop:
         else:
             mask_2d = mask
 
-        # Resize mask if dimensions don't match
         if mask_2d.shape[0] != H or mask_2d.shape[1] != W:
             mask_2d = torch.nn.functional.interpolate(
                 mask_2d.unsqueeze(0).unsqueeze(0).float(),
@@ -1107,7 +1085,6 @@ class GemstoneInpaintCrop:
         if invert_mask:
             mask_2d = 1.0 - mask_2d
 
-        # Find bounding box of non-zero mask region
         mask_binary = (mask_2d > 0.01).float()
         nonzero = torch.nonzero(mask_binary, as_tuple=False)
 
@@ -1121,7 +1098,6 @@ class GemstoneInpaintCrop:
             x_min = nonzero[:, 1].min().item()
             x_max = nonzero[:, 1].max().item()
 
-            # Apply padding — clamped to image bounds (never errors)
             y_min = max(0, y_min - padding)
             y_max = min(H - 1, y_max + padding)
             x_min = max(0, x_min - padding)
@@ -1135,7 +1111,6 @@ class GemstoneInpaintCrop:
         logger.info("[InpaintCrop] BBox: (%d,%d) %dx%d  padding=%d  image=%dx%d",
                     bbox_x, bbox_y, bbox_w, bbox_h, padding, W, H)
 
-        # Crop
         cropped_image = image[:, bbox_y:bbox_y + bbox_h, bbox_x:bbox_x + bbox_w, :]
         cropped_mask_2d = mask_2d[bbox_y:bbox_y + bbox_h, bbox_x:bbox_x + bbox_w]
 
@@ -1144,7 +1119,6 @@ class GemstoneInpaintCrop:
         else:
             cropped_mask = cropped_mask_2d.unsqueeze(0)
 
-        # Masked composite (preview)
         mask_expanded = cropped_mask.unsqueeze(-1).expand(-1, -1, -1, C)
         masked_composite = cropped_image * mask_expanded
 
@@ -1203,7 +1177,6 @@ class GemstoneInpaintStitch:
 
         logger.info("[InpaintStitch] Pasting %dx%d at (%d,%d) mode=%s", bw, bh, bx, by, blend_mode)
 
-        # Resize crop if needed
         crop = processed_crop
         if crop.shape[1] != bh or crop.shape[2] != bw:
             crop = torch.nn.functional.interpolate(
@@ -1211,7 +1184,6 @@ class GemstoneInpaintStitch:
                 size=(bh, bw), mode="bilinear", align_corners=False,
             ).permute(0, 2, 3, 1)
 
-        # Match channels
         if crop.shape[3] != C:
             if crop.shape[3] > C:
                 crop = crop[:, :, :, :C]
@@ -1224,7 +1196,6 @@ class GemstoneInpaintStitch:
         if blend_mode == "replace":
             result[:, by:by + bh, bx:bx + bw, :] = crop
         else:
-            # Feathered blend
             if blend_mask is not None:
                 if blend_mask.ndim == 3:
                     alpha = blend_mask[0]
@@ -1236,11 +1207,9 @@ class GemstoneInpaintStitch:
                         size=(bh, bw), mode="bilinear", align_corners=False,
                     ).squeeze(0).squeeze(0)
             else:
-                # Auto-generate feathered edge mask
                 alpha = torch.ones(bh, bw, dtype=torch.float32)
                 if feather_radius > 0:
                     alpha_np = (alpha.numpy() * 255).astype(np.uint8)
-                    # Erode then blur for smooth falloff
                     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
                                                        (feather_radius * 2 + 1, feather_radius * 2 + 1))
                     eroded = cv2.erode(alpha_np, kernel, iterations=1)

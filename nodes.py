@@ -315,65 +315,41 @@ class SAM3Gemstone:
         return pipe
 
     # =====================================================================
-    #  ZIM segmentation — smooth alpha edges via guided filter + Gaussian
+    #  ZIM segmentation — raw sigmoid alpha (no post-processing)
     # =====================================================================
-    @staticmethod
-    def _smooth_alpha(alpha_np: np.ndarray, crop_rgb: np.ndarray,
-                      guide_radius: int = 8, guide_eps: float = 0.01,
-                      blur_ksize: int = 5, blur_sigma: float = 0.8) -> np.ndarray:
-        """Smooth ZIM alpha edges using guided filter + edge-band Gaussian.
-
-        1. Guided filter: smooths alpha respecting RGB edges (like Adobe Refine Edge)
-        2. Edge-band Gaussian: anti-aliases only the boundary pixels
-        3. Interior stays solid (1.0), exterior stays transparent (0.0)
-
-        All operations in float32 to preserve sigmoid precision.
-        """
-        # Step 1: Guided filter — edge-aware smoothing using RGB as guide
-        # Work in float32 throughout to preserve ZIM's sigmoid precision
-        guide_gray = cv2.cvtColor(crop_rgb, cv2.COLOR_RGB2GRAY).astype(np.float32) / 255.0
-        refined = cv2.ximgproc.guidedFilter(
-            guide=guide_gray, src=alpha_np.astype(np.float32),
-            radius=guide_radius, eps=guide_eps,
-        )
-
-        # Step 2: Build edge band mask (boundary zone between fg and bg)
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-        binary = (refined > 0.5).astype(np.uint8) * 255
-        inner = cv2.erode(binary, kernel, iterations=1)
-        outer = cv2.dilate(binary, kernel, iterations=1)
-        edge_band = ((outer > 0) & (inner == 0)).astype(np.float32)
-
-        # Step 3: Gaussian blur for anti-aliasing in edge band only
-        blurred = cv2.GaussianBlur(refined, (blur_ksize, blur_ksize), blur_sigma)
-
-        # Step 4: Blend — smooth edges in band, keep crisp interior/exterior
-        result = refined * (1 - edge_band) + blurred * edge_band
-
-        return np.clip(result, 0, 1).astype(np.float32)
-
     def _segment_with_zim(self, zim_predictor, np_img: np.ndarray,
                           boxes: list[torch.Tensor], H: int, W: int) -> torch.Tensor:
         """Segment each detection with ZIM alpha matting (no SAM3 masks needed).
 
-        SAM3 is used as detector only — provides boxes. ZIM crops around each
-        box with padding and produces sigmoid alpha [0,1] masks.
-        Point prompt: bbox center = foreground, 4 edge midpoints outside = background.
-        Post-processing: guided filter + edge-band Gaussian for smooth edges.
+        SAM3 = detector only (boxes). ZIM crops around each box with padding
+        and produces sigmoid alpha [0,1] masks directly — no post-processing.
+
+        ZIM's sigmoid output is already smooth and high-quality:
+        - Decoder produces logits at 256×256
+        - Bilinear upscale: 256 → 512 → 1024 → original crop size
+        - .sigmoid() converts to continuous [0,1] alpha
+
+        Point prompts create soft Gaussian attention (sigma=6) in ZIM's
+        64×64 attention space — this gives ZIM spatial focus for each object.
+        Multiple fg points + adaptive bg margin maximize mask quality.
+
+        multimask_output=True returns 4 masks + IoU scores — we pick the best.
         """
         t0 = time.time()
         MIN_PAD = 15
         MAX_PAD = 60
         unified_mask = torch.zeros(H, W, dtype=torch.float32)
 
-        logger.info("[ZIM] Segmenting %d objects (crop per box, smooth edges)", len(boxes))
+        logger.info("[ZIM] Segmenting %d objects (multimask + best IoU, raw sigmoid)", len(boxes))
 
         for idx, box in enumerate(boxes):
             bx1, by1 = box[0].item(), box[1].item()
             bx2, by2 = box[2].item(), box[3].item()
 
             # Adaptive padding: 30% of bbox size, clamped to [MIN_PAD, MAX_PAD]
-            bbox_size = max(bx2 - bx1, by2 - by1)
+            bbox_w = bx2 - bx1
+            bbox_h = by2 - by1
+            bbox_size = max(bbox_w, bbox_h)
             pad = int(max(MIN_PAD, min(MAX_PAD, bbox_size * 0.3)))
 
             # Crop around detection bbox with padding
@@ -386,32 +362,55 @@ class SAM3Gemstone:
             zim_predictor.set_image(crop)
 
             local_box = np.array([bx1 - x1, by1 - y1, bx2 - x1, by2 - y1], dtype=np.float32)
+            lx1, ly1, lx2, ly2 = local_box
 
-            # Point prompts: center of box = foreground, 4 outside points = background
-            cx = (local_box[0] + local_box[2]) / 2
-            cy = (local_box[1] + local_box[3]) / 2
+            # --- Build rich point prompts for ZIM's soft Gaussian attention ---
+            # Foreground: center + 4 quadrant points inside bbox
+            cx = (lx1 + lx2) / 2
+            cy = (ly1 + ly2) / 2
+            qx = (lx2 - lx1) * 0.25  # quarter offsets
+            qy = (ly2 - ly1) * 0.25
+
+            fg_points = [
+                [cx, cy],                # center
+                [cx - qx, cy - qy],      # top-left quadrant
+                [cx + qx, cy - qy],      # top-right quadrant
+                [cx - qx, cy + qy],      # bottom-left quadrant
+                [cx + qx, cy + qy],      # bottom-right quadrant
+            ]
+
+            # Background: 4 points outside bbox with adaptive margin
+            # Margin scales with bbox size — larger objects need more spacing
             crop_h, crop_w = y2 - y1, x2 - x1
-            margin = 3
-            pt_coords = np.array([
-                [cx, cy],  # foreground: box center
-                [max(0, local_box[0] - margin), cy],                    # bg: left
-                [min(crop_w - 1, local_box[2] + margin), cy],           # bg: right
-                [cx, max(0, local_box[1] - margin)],                    # bg: top
-                [cx, min(crop_h - 1, local_box[3] + margin)],           # bg: bottom
-            ], dtype=np.float32)
-            pt_labels = np.array([1, 0, 0, 0, 0], dtype=np.int32)
+            bg_margin = max(5, int(bbox_size * 0.1))
 
-            masks, scores, _ = zim_predictor.predict(
+            bg_points = [
+                [max(0, lx1 - bg_margin), cy],                     # left
+                [min(crop_w - 1, lx2 + bg_margin), cy],            # right
+                [cx, max(0, ly1 - bg_margin)],                     # top
+                [cx, min(crop_h - 1, ly2 + bg_margin)],            # bottom
+            ]
+
+            pt_coords = np.array(fg_points + bg_points, dtype=np.float32)
+            pt_labels = np.array([1] * len(fg_points) + [0] * len(bg_points), dtype=np.int32)
+
+            # multimask_output=True → 4 masks + IoU scores, pick best
+            masks, iou_scores, _ = zim_predictor.predict(
                 point_coords=pt_coords, point_labels=pt_labels,
-                box=local_box, multimask_output=False,
+                box=local_box, multimask_output=True,
             )
 
-            # Smooth alpha edges — guided filter + edge-band Gaussian AA
-            raw_alpha = masks[0].astype(np.float32)
-            smooth_alpha = self._smooth_alpha(raw_alpha, crop)
+            # Select mask with highest predicted IoU
+            best_idx = int(np.argmax(iou_scores))
+            best_alpha = masks[best_idx].astype(np.float32)
 
-            # Map crop alpha back to full image, max-union merge
-            crop_alpha = torch.from_numpy(smooth_alpha)
+            logger.debug("  [ZIM] obj %d: best_mask=%d iou=%.3f (all: %s)",
+                         idx, best_idx, iou_scores[best_idx],
+                         ", ".join(f"{s:.3f}" for s in iou_scores))
+
+            # Use raw ZIM sigmoid directly — no post-processing needed.
+            # ZIM's bilinear upscale + sigmoid already produces smooth alpha.
+            crop_alpha = torch.from_numpy(best_alpha)
             unified_mask[y1:y2, x1:x2] = torch.max(
                 unified_mask[y1:y2, x1:x2], crop_alpha)
 
@@ -794,26 +793,47 @@ class ZIMRefineMask:
 
     @staticmethod
     def _mask_to_points(obj_mask_u8: np.ndarray, bx1: int, by1: int, bx2: int, by2: int,
-                        H: int, W: int, n_bg: int = 4) -> tuple[np.ndarray | None, np.ndarray | None]:
-        """Extract point prompts from binary mask for ZIM.
-        Returns (point_coords Nx2, point_labels N) or (None, None)."""
+                        H: int, W: int) -> tuple[np.ndarray | None, np.ndarray | None]:
+        """Extract rich point prompts from binary mask for ZIM.
+
+        Foreground: centroid + 4 quadrant points inside bbox (5 points).
+        Background: 4 points outside bbox with adaptive margin.
+        More fg points = stronger soft Gaussian attention in ZIM's 64×64 space.
+        Returns (point_coords Nx2, point_labels N) or (None, None).
+        """
         ys, xs = np.where(obj_mask_u8 > 0)
         if len(ys) == 0:
             return None, None
+
+        # Foreground: centroid + 4 quadrant points
         cx = float(xs.mean())
         cy = float(ys.mean())
-        margin = 3
-        bg_candidates = [
-            (max(0, bx1 - margin), (by1 + by2) / 2),
-            (min(W - 1, bx2 + margin), (by1 + by2) / 2),
-            ((bx1 + bx2) / 2, max(0, by1 - margin)),
-            ((bx1 + bx2) / 2, min(H - 1, by2 + margin)),
+        bbox_w = bx2 - bx1
+        bbox_h = by2 - by1
+        qx = bbox_w * 0.25
+        qy = bbox_h * 0.25
+
+        fg_coords = [
+            [cx, cy],
+            [cx - qx, cy - qy],
+            [cx + qx, cy - qy],
+            [cx - qx, cy + qy],
+            [cx + qx, cy + qy],
         ]
-        coords = [[cx, cy]]
-        labels = [1]
-        for bx, by in bg_candidates[:n_bg]:
-            coords.append([bx, by])
-            labels.append(0)
+
+        # Background: adaptive margin based on bbox size
+        bg_margin = max(5, int(max(bbox_w, bbox_h) * 0.1))
+        mid_x = (bx1 + bx2) / 2
+        mid_y = (by1 + by2) / 2
+        bg_coords = [
+            [max(0, bx1 - bg_margin), mid_y],
+            [min(W - 1, bx2 + bg_margin), mid_y],
+            [mid_x, max(0, by1 - bg_margin)],
+            [mid_x, min(H - 1, by2 + bg_margin)],
+        ]
+
+        coords = fg_coords + bg_coords
+        labels = [1] * len(fg_coords) + [0] * len(bg_coords)
         return np.array(coords, dtype=np.float32), np.array(labels, dtype=np.int32)
 
     def run(self, image, mask, chain_mode):
@@ -918,15 +938,16 @@ class ZIMRefineMask:
                         local_mask, x1 - cx1, y1 - cy1, x2 - cx1, y2 - cy1, crop_h, crop_w)
 
                     if pt_coords is not None:
-                        masks_out, scores, _ = predictor.predict(
+                        masks_out, iou_scores, _ = predictor.predict(
                             point_coords=pt_coords, point_labels=pt_labels,
-                            box=local_box, multimask_output=False)
+                            box=local_box, multimask_output=True)
                     else:
-                        masks_out, scores, _ = predictor.predict(box=local_box, multimask_output=False)
+                        masks_out, iou_scores, _ = predictor.predict(
+                            box=local_box, multimask_output=True)
 
-                    # Smooth alpha edges — guided filter + edge-band Gaussian AA
-                    raw_alpha = masks_out[0].astype(np.float32)
-                    crop_alpha = SAM3Gemstone._smooth_alpha(raw_alpha, crop)
+                    # Select best mask by predicted IoU — use raw ZIM sigmoid
+                    best_idx = int(np.argmax(iou_scores))
+                    crop_alpha = masks_out[best_idx].astype(np.float32)
 
                     full_zim_alpha = np.zeros((H, W), dtype=np.float32)
                     full_zim_alpha[cy1:cy2, cx1:cx2] = crop_alpha

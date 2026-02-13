@@ -331,7 +331,7 @@ class SAM3Gemstone:
     #  ZIM segmentation — hybrid tile-batch + per-crop
     # =====================================================================
     _TINY_BBOX_PX = 24     # Below this: box-only prompt, always binarize
-    _SMALL_BBOX_PX = 64    # Below this: box + single center fg point
+    _SMALL_BBOX_PX = 192   # Below this: tile-batch (box + center point). Above: per-crop (5fg+4bg)
     _ZIM_TILE_SIZE = 1024   # Tile size for batch approach (matches ZIM internal res)
     _ZIM_TILE_OVERLAP = 128 # Overlap in pixels between tiles
 
@@ -472,9 +472,24 @@ class SAM3Gemstone:
                     masks, iou_scores, _ = zim_predictor.predict(
                         box=local_box, multimask_output=False)
                     best_alpha = masks[0].astype(np.float32)
-                else:
+                elif bbox_size < 64:
+                    # Small: box + 1 center fg point
                     pt_coords = np.array([[cx, cy]], dtype=np.float32)
                     pt_labels = np.array([1], dtype=np.int32)
+                    masks, iou_scores, _ = zim_predictor.predict(
+                        point_coords=pt_coords, point_labels=pt_labels,
+                        box=local_box, multimask_output=True)
+                    best_idx = int(np.argmax(iou_scores))
+                    best_alpha = masks[best_idx].astype(np.float32)
+                else:
+                    # Medium (64-192px): box + 5fg points for better quality
+                    qx = (lx2 - lx1) * 0.25
+                    qy = (ly2 - ly1) * 0.25
+                    fg = [[cx, cy],
+                          [cx - qx, cy - qy], [cx + qx, cy - qy],
+                          [cx - qx, cy + qy], [cx + qx, cy + qy]]
+                    pt_coords = np.array(fg, dtype=np.float32)
+                    pt_labels = np.array([1] * 5, dtype=np.int32)
                     masks, iou_scores, _ = zim_predictor.predict(
                         point_coords=pt_coords, point_labels=pt_labels,
                         box=local_box, multimask_output=True)

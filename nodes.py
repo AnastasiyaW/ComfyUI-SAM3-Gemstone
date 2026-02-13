@@ -648,7 +648,7 @@ class SAM3Gemstone:
 
         logger.info("[Surviving] %d detections → mask merge", len(surviving_indices))
 
-        # --- Upscale surviving masks and merge ---
+        # --- Upscale surviving masks, crop to bbox, and merge ---
         unified_mask = torch.zeros(H, W, dtype=torch.float32)
         has_masks = len(all_masks) == len(all_boxes)
 
@@ -657,7 +657,7 @@ class SAM3Gemstone:
             for idx_val in surviving_indices:
                 mask_lr, tx1, ty1, tx2, ty2 = all_masks[idx_val]
                 tile_h, tile_w = ty2 - ty1, tx2 - tx1
-                # Upscale low-res mask to tile size
+                # Upscale low-res mask to tile/full-frame size
                 mask_up = torch.nn.functional.interpolate(
                     mask_lr.unsqueeze(0).unsqueeze(0).float(),
                     size=(tile_h, tile_w),
@@ -667,8 +667,37 @@ class SAM3Gemstone:
                 if mask_threshold > 0.0:
                     mask_up = (mask_up > mask_threshold).float()
 
-                unified_mask[ty1:ty2, tx1:tx2] = torch.max(
-                    unified_mask[ty1:ty2, tx1:tx2], mask_up)
+                # CRITICAL: crop mask to detection bbox + padding.
+                # SAM3 mask covers the entire tile/image — we only want the
+                # region around this specific detection's bounding box.
+                box = all_boxes[idx_val]
+                bx1, by1 = int(box[0].item()), int(box[1].item())
+                bx2, by2 = int(box[2].item()), int(box[3].item())
+                bbox_size = max(bx2 - bx1, by2 - by1)
+                pad = max(5, int(bbox_size * 0.15))
+
+                # Clamp to image bounds
+                rx1 = max(0, bx1 - pad)
+                ry1 = max(0, by1 - pad)
+                rx2 = min(W, bx2 + pad)
+                ry2 = min(H, by2 + pad)
+
+                # Convert to tile-local coords for indexing mask_up
+                lx1 = rx1 - tx1
+                ly1 = ry1 - ty1
+                lx2 = rx2 - tx1
+                ly2 = ry2 - ty1
+
+                # Bounds check (mask_up is tile-sized, not full image)
+                lx1 = max(0, min(lx1, tile_w))
+                ly1 = max(0, min(ly1, tile_h))
+                lx2 = max(0, min(lx2, tile_w))
+                ly2 = max(0, min(ly2, tile_h))
+
+                if lx2 > lx1 and ly2 > ly1:
+                    cropped = mask_up[ly1:ly2, lx1:lx2]
+                    unified_mask[ry1:ry2, rx1:rx2] = torch.max(
+                        unified_mask[ry1:ry2, rx1:rx2], cropped)
 
             logger.info("[Merge] %d masks upscaled+merged in %.2fs",
                         len(surviving_indices), time.time() - t_merge)

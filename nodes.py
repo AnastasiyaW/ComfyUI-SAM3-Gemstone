@@ -115,6 +115,52 @@ def _build_edge_band(obj_mask_u8, band_inner, band_outer):
     return band
 
 
+# ---------------------------------------------------------------------------
+# Smooth mask contours — vector-like clean edges without blur or aliasing
+# ---------------------------------------------------------------------------
+def _smooth_mask_contours(mask_f32, epsilon_factor=1.0):
+    """Redraw mask with smoothed contours for clean vector-like edges.
+
+    1. Binarize mask
+    2. Find contours
+    3. Approximate each contour with cv2.approxPolyDP (simplify jagged edges)
+    4. Redraw all contours filled, with cv2.LINE_AA antialiasing
+    5. Result: smooth edges, no jagging, no blur
+
+    epsilon_factor: controls smoothing strength.
+        Higher = smoother (more simplification). 1.0 = good default.
+        0.5 = less smoothing (closer to original). 2.0+ = very smooth.
+    """
+    binary = (mask_f32 > 0.5).astype(np.uint8) * 255
+
+    contours, hierarchy = cv2.findContours(binary, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
+
+    if not contours:
+        return mask_f32
+
+    # Create clean output
+    H, W = mask_f32.shape
+    smooth = np.zeros((H, W), dtype=np.uint8)
+
+    smoothed_contours = []
+    for cnt in contours:
+        # Perimeter-based epsilon — larger contours get proportionally more smoothing
+        perimeter = cv2.arcLength(cnt, closed=True)
+        epsilon = epsilon_factor * 0.002 * perimeter  # 0.2% of perimeter per factor unit
+        approx = cv2.approxPolyDP(cnt, epsilon, closed=True)
+        smoothed_contours.append(approx)
+
+    # Redraw using hierarchy to handle holes correctly
+    if hierarchy is not None:
+        cv2.drawContours(smooth, smoothed_contours, -1, 255, thickness=cv2.FILLED,
+                         lineType=cv2.LINE_AA, hierarchy=hierarchy)
+    else:
+        cv2.drawContours(smooth, smoothed_contours, -1, 255, thickness=cv2.FILLED,
+                         lineType=cv2.LINE_AA)
+
+    return smooth.astype(np.float32) / 255.0
+
+
 # ============================================================================
 #  SINGLE NODE — SAM3 Gemstone Segmentation
 # ============================================================================
@@ -882,6 +928,10 @@ class ZIMRefineMask:
                     "default": 0.10, "min": 0.0, "max": 1.0, "step": 0.05,
                     "tooltip": "Min ZIM coverage within object to accept (0=always accept ZIM, 1=always fallback)",
                 }),
+                "contour_smooth": ("FLOAT", {
+                    "default": 1.0, "min": 0.0, "max": 5.0, "step": 0.1,
+                    "tooltip": "Contour smoothing strength (0=off). Redraw mask with smooth vector-like edges.",
+                }),
             },
         }
 
@@ -891,7 +941,7 @@ class ZIMRefineMask:
     CATEGORY = "SAM3-Gemstone"
 
     def run(self, image, mask, min_object_area, crop_padding, large_object_pct,
-            band_inner, band_outer, zim_min_coverage):
+            band_inner, band_outer, zim_min_coverage, contour_smooth):
         t0 = time.time()
         B, H, W, C = image.shape
         logger.info("=" * 60)
@@ -945,8 +995,12 @@ class ZIMRefineMask:
             logger.info("[ZIM-Refine] %d small + %d large (skipped %d tiny < %d px)",
                         len(small_objects), len(large_objects), skipped_tiny, min_object_area)
 
-            # Original mask = BASE (interior always filled)
-            unified_alpha = mask_np.astype(np.float32)
+            # ---------------------------------------------------------------
+            # Strategy: Use ZIM alpha DIRECTLY as the mask for each object.
+            # ZIM produces pixel-perfect edges natively.
+            # If ZIM doesn't find object (low coverage) → keep SAM3 mask.
+            # ---------------------------------------------------------------
+            unified_alpha = np.zeros((H, W), dtype=np.float32)
 
             zim_refined = 0
             zim_fallback = 0
@@ -962,17 +1016,23 @@ class ZIMRefineMask:
 
                     obj_mask_u8 = (labels == label_id).astype(np.uint8)
 
+                    # Check if ZIM found something meaningful in this object's area
                     obj_coverage = (zim_alpha * obj_mask_u8).sum() / max(obj_mask_u8.sum(), 1)
 
                     if obj_coverage < zim_min_coverage:
+                        # ZIM didn't find it → use original SAM3 mask for this object
                         zim_fallback += 1
+                        unified_alpha = np.maximum(unified_alpha, obj_mask_u8.astype(np.float32))
                         logger.debug("  [ZIM] obj %d: coverage %.1f%% → FALLBACK",
                                      label_id, obj_coverage * 100)
                         continue
 
-                    edge_band = _build_edge_band(obj_mask_u8, band_inner, band_outer)
-                    blended = unified_alpha * (1.0 - edge_band) + zim_alpha * edge_band
-                    unified_alpha = np.maximum(unified_alpha, blended)
+                    # Use ZIM alpha directly — its edges are pixel-perfect
+                    # Constrain to dilated object region to avoid ZIM bleeding into neighbors
+                    kern = cv2.getStructuringElement(
+                        cv2.MORPH_ELLIPSE, (band_outer * 2 + 1, band_outer * 2 + 1))
+                    obj_zone = cv2.dilate(obj_mask_u8, kern, iterations=1).astype(np.float32)
+                    unified_alpha = np.maximum(unified_alpha, zim_alpha * obj_zone)
                     zim_refined += 1
 
                     if (idx + 1) % 50 == 0:
@@ -1005,18 +1065,32 @@ class ZIMRefineMask:
 
                     if obj_coverage < zim_min_coverage:
                         zim_fallback += 1
+                        unified_alpha = np.maximum(unified_alpha, obj_mask_u8.astype(np.float32))
                         logger.debug("  [ZIM] large obj %d: coverage %.1f%% → FALLBACK",
                                      label_id, obj_coverage * 100)
                         continue
 
-                    edge_band = _build_edge_band(obj_mask_u8, band_inner, band_outer)
-                    blended = unified_alpha * (1.0 - edge_band) + full_zim_alpha * edge_band
-                    unified_alpha = np.maximum(unified_alpha, blended)
+                    # Use ZIM alpha directly within dilated object zone
+                    kern = cv2.getStructuringElement(
+                        cv2.MORPH_ELLIPSE, (band_outer * 2 + 1, band_outer * 2 + 1))
+                    obj_zone = cv2.dilate(obj_mask_u8, kern, iterations=1).astype(np.float32)
+                    unified_alpha = np.maximum(unified_alpha, full_zim_alpha * obj_zone)
                     zim_refined += 1
 
                 logger.info("[ZIM-Refine] %d large: %.2fs", len(large_objects), time.time() - t_large)
 
+            # Tiny objects that were skipped — add their original mask
+            for label_id in range(1, num_labels):
+                ys, xs = np.where(labels == label_id)
+                if len(ys) < min_object_area:
+                    unified_alpha = np.maximum(
+                        unified_alpha, (labels == label_id).astype(np.float32))
+
             logger.info("[ZIM-Refine] Refined: %d, Fallback: %d", zim_refined, zim_fallback)
+
+            # Optional contour smoothing
+            if contour_smooth > 0:
+                unified_alpha = _smooth_mask_contours(unified_alpha, contour_smooth)
 
             refined_mask = torch.from_numpy(unified_alpha).clamp(0, 1)
 

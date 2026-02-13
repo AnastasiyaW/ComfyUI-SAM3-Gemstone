@@ -745,12 +745,240 @@ class SAM3Gemstone:
 
 
 # ============================================================================
+#  STANDALONE NODE — ZIM Refine Mask
+# ============================================================================
+class ZIMRefineMask:
+    """Takes an image and a rough mask, refines edges of each object using ZIM alpha matting.
+    Works with masks from any source (SAM3, manual, other segmenters).
+    Processes objects by cropping around each connected component's bbox
+    for maximum resolution. Small objects are batched on the full image."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "image": ("IMAGE",),
+                "mask": ("MASK",),
+                "min_object_area": ("INT", {
+                    "default": 100, "min": 10, "max": 100000, "step": 10,
+                    "tooltip": "Minimum object area in pixels to refine (skip tiny noise)",
+                }),
+                "crop_padding": ("INT", {
+                    "default": 30, "min": 0, "max": 200, "step": 5,
+                    "tooltip": "Pixels of padding around each object bbox for ZIM crop",
+                }),
+                "large_object_pct": ("FLOAT", {
+                    "default": 5.0, "min": 1.0, "max": 50.0, "step": 1.0,
+                    "tooltip": "Objects above this % of image area get individual crops",
+                }),
+            },
+        }
+
+    RETURN_TYPES = ("MASK", "IMAGE")
+    RETURN_NAMES = ("refined_mask", "overlay")
+    FUNCTION = "run"
+    CATEGORY = "SAM3-Gemstone"
+
+    def _load_zim(self):
+        """Load ZIM model (shared cache with SAM3Gemstone node)."""
+        if "zim" in _zim_cache:
+            logger.info("[ZIM-Refine] Returning cached ZIM predictor")
+            return _zim_cache["zim"]
+
+        t0 = time.time()
+        logger.info("[ZIM-Refine] Loading ZIM model (backbone=%s)...", ZIM_BACKBONE)
+
+        from zim_anything import zim_model_registry, ZimPredictor
+
+        ckpt_dir = os.path.join(ZIM_MODEL_DIR, ZIM_CKPT_SUBDIR)
+        encoder_path = os.path.join(ckpt_dir, "encoder.onnx")
+        decoder_path = os.path.join(ckpt_dir, "decoder.onnx")
+
+        assert os.path.isfile(encoder_path), (
+            f"ZIM encoder NOT FOUND: {encoder_path}. "
+            f"Download from HuggingFace naver-iv/zim-anything-vitb"
+        )
+        assert os.path.isfile(decoder_path), (
+            f"ZIM decoder NOT FOUND: {decoder_path}. "
+            f"Download from HuggingFace naver-iv/zim-anything-vitb"
+        )
+
+        enc_mb = os.path.getsize(encoder_path) / (1024**2)
+        dec_mb = os.path.getsize(decoder_path) / (1024**2)
+        logger.info("[ZIM-Refine] Encoder: %.1f MB, Decoder: %.1f MB", enc_mb, dec_mb)
+
+        zim_model = zim_model_registry[ZIM_BACKBONE](checkpoint=ckpt_dir)
+        if torch.cuda.is_available():
+            zim_model.cuda()
+        predictor = ZimPredictor(zim_model)
+
+        _zim_cache["zim"] = predictor
+        logger.info("[ZIM-Refine] Loaded in %.1fs", time.time() - t0)
+        return predictor
+
+    def run(
+        self,
+        image: torch.Tensor,
+        mask: torch.Tensor,
+        min_object_area: int,
+        crop_padding: int,
+        large_object_pct: float,
+    ):
+        t0 = time.time()
+        B, H, W, C = image.shape
+        logger.info("=" * 60)
+        logger.info("[ZIM-Refine] START  B=%d  H=%d  W=%d", B, H, W)
+        logger.info("=" * 60)
+
+        predictor = self._load_zim()
+
+        all_masks_out = []
+        all_overlays_out = []
+
+        for b_idx in range(B):
+            t_batch = time.time()
+            np_img = (image[b_idx].cpu().numpy() * 255).astype(np.uint8)
+
+            # Get binary mask for this batch item
+            if mask.ndim == 3:
+                mask_np = (mask[b_idx].cpu().numpy() > 0.5).astype(np.uint8)
+            elif mask.ndim == 2:
+                mask_np = (mask.cpu().numpy() > 0.5).astype(np.uint8)
+            else:
+                mask_np = (mask[b_idx].cpu().numpy() > 0.5).astype(np.uint8)
+
+            # Find connected components → individual object bboxes
+            num_labels, labels = cv2.connectedComponents(mask_np, connectivity=8)
+            n_objects = num_labels - 1  # exclude background (label 0)
+            logger.info("[ZIM-Refine] Batch %d: %d objects found in mask", b_idx, n_objects)
+
+            if n_objects == 0:
+                all_masks_out.append(torch.zeros(H, W, dtype=torch.float32))
+                overlay = image[b_idx].cpu().clone()
+                all_overlays_out.append(overlay)
+                continue
+
+            # Collect bboxes for each object
+            image_area = H * W
+            small_objects = []  # (label, x1, y1, x2, y2)
+            large_objects = []
+
+            for label_id in range(1, num_labels):
+                ys, xs = np.where(labels == label_id)
+                obj_area = len(ys)
+                if obj_area < min_object_area:
+                    logger.debug("  Object %d: area=%d < min=%d, skipping", label_id, obj_area, min_object_area)
+                    continue
+
+                x1, y1 = int(xs.min()), int(ys.min())
+                x2, y2 = int(xs.max()) + 1, int(ys.max()) + 1
+                area_pct = obj_area / image_area * 100
+
+                if area_pct >= large_object_pct:
+                    large_objects.append((label_id, x1, y1, x2, y2))
+                else:
+                    small_objects.append((label_id, x1, y1, x2, y2))
+
+            logger.info("[ZIM-Refine] %d small + %d large objects to refine (skipped %d tiny)",
+                        len(small_objects), len(large_objects),
+                        n_objects - len(small_objects) - len(large_objects))
+
+            unified_alpha = np.zeros((H, W), dtype=np.float32)
+
+            # --- Small objects: one set_image on full image, iterate bboxes ---
+            if small_objects:
+                t_small = time.time()
+                predictor.set_image(np_img)
+                logger.info("[ZIM-Refine] Full-image encoder for %d small objects: %.2fs",
+                            len(small_objects), time.time() - t_small)
+
+                for idx, (label_id, x1, y1, x2, y2) in enumerate(small_objects):
+                    bbox_np = np.array([x1, y1, x2, y2], dtype=np.float32)
+                    masks_out, scores, _ = predictor.predict(
+                        box=bbox_np,
+                        multimask_output=False,
+                    )
+                    alpha = masks_out[0].astype(np.float32)
+                    # Only apply within original mask region for this object
+                    obj_region = (labels == label_id)
+                    # Expand the region slightly to allow ZIM to extend edges
+                    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+                    obj_region_expanded = cv2.dilate(obj_region.astype(np.uint8), kernel, iterations=2)
+                    # Combine: ZIM alpha within expanded object region
+                    unified_alpha = np.maximum(unified_alpha, alpha * obj_region_expanded)
+
+                    if (idx + 1) % 50 == 0:
+                        logger.info("[ZIM-Refine] Small: %d/%d done", idx + 1, len(small_objects))
+
+                logger.info("[ZIM-Refine] %d small objects: %.2fs",
+                            len(small_objects), time.time() - t_small)
+
+            # --- Large objects: individual crops ---
+            if large_objects:
+                t_large = time.time()
+                for label_id, x1, y1, x2, y2 in large_objects:
+                    cx1 = max(0, x1 - crop_padding)
+                    cy1 = max(0, y1 - crop_padding)
+                    cx2 = min(W, x2 + crop_padding)
+                    cy2 = min(H, y2 + crop_padding)
+
+                    crop = np_img[cy1:cy2, cx1:cx2].copy()
+                    predictor.set_image(crop)
+
+                    local_box = np.array([
+                        x1 - cx1, y1 - cy1, x2 - cx1, y2 - cy1
+                    ], dtype=np.float32)
+
+                    masks_out, scores, _ = predictor.predict(
+                        box=local_box,
+                        multimask_output=False,
+                    )
+
+                    crop_alpha = masks_out[0].astype(np.float32)
+                    # Place back with object region constraint
+                    obj_region = (labels == label_id)
+                    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+                    obj_region_expanded = cv2.dilate(obj_region.astype(np.uint8), kernel, iterations=3)
+                    full_alpha = np.zeros((H, W), dtype=np.float32)
+                    full_alpha[cy1:cy2, cx1:cx2] = crop_alpha
+                    unified_alpha = np.maximum(unified_alpha, full_alpha * obj_region_expanded)
+
+                logger.info("[ZIM-Refine] %d large objects: %.2fs",
+                            len(large_objects), time.time() - t_large)
+
+            # Convert to tensor
+            refined_mask = torch.from_numpy(unified_alpha)
+
+            # Generate overlay
+            img_tensor = image[b_idx].cpu().clone()
+            mask_3d = refined_mask.unsqueeze(-1)
+            overlay = img_tensor.clone()
+            gem_color = torch.tensor([0.0, 1.0, 0.3], dtype=torch.float32)
+            alpha_blend = 0.35
+            overlay = overlay * (1 - mask_3d * alpha_blend) + gem_color * mask_3d * alpha_blend
+            overlay = overlay.clamp(0, 1)
+
+            all_masks_out.append(refined_mask)
+            all_overlays_out.append(overlay)
+            logger.info("[ZIM-Refine] Batch %d: %.2fs", b_idx, time.time() - t_batch)
+
+        mask_batch = torch.stack(all_masks_out, dim=0)
+        overlay_batch = torch.stack(all_overlays_out, dim=0)
+
+        logger.info("[ZIM-Refine] DONE in %.1fs  mask=%s overlay=%s",
+                    time.time() - t0, mask_batch.shape, overlay_batch.shape)
+        return (mask_batch, overlay_batch)
+
+
+# ============================================================================
 #  MAPPINGS
 # ============================================================================
 NODE_CLASS_MAPPINGS = {
     "SAM3Gemstone": SAM3Gemstone,
+    "ZIMRefineMask": ZIMRefineMask,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "SAM3Gemstone": "SAM3 Gemstone",
+    "ZIMRefineMask": "ZIM Refine Mask",
 }

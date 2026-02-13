@@ -328,65 +328,190 @@ class SAM3Gemstone:
         return pipe
 
     # =====================================================================
-    #  ZIM segmentation — raw sigmoid alpha (no post-processing)
+    #  ZIM segmentation — hybrid tile-batch + per-crop
     # =====================================================================
-    # Size thresholds for adaptive ZIM strategy
     _TINY_BBOX_PX = 24     # Below this: box-only prompt, always binarize
     _SMALL_BBOX_PX = 64    # Below this: box + single center fg point
-    # Above _SMALL_BBOX_PX: full rich prompts (5 fg + 4 bg)
+    _ZIM_TILE_SIZE = 1024   # Tile size for batch approach (matches ZIM internal res)
+    _ZIM_TILE_OVERLAP = 128 # Overlap in pixels between tiles
 
     def _segment_with_zim(self, zim_predictor, np_img: np.ndarray,
                           boxes: list[torch.Tensor], H: int, W: int,
                           mask_threshold: float = 0.5) -> torch.Tensor:
-        """Segment each detection with ZIM alpha matting.
+        """Hybrid ZIM segmentation: tile-batch for small gems, per-crop for large.
 
-        Size-adaptive strategy:
-        - TINY  (bbox < 24px): box-only prompt → hard binary attention → binarize.
-          ZIM's soft Gaussian attention is too broad for objects this small.
-          Box prompt gives hard binary mask in 64×64 attention space = better focus.
-        - SMALL (bbox < 64px): box + single center fg point → binarize.
-          One Gaussian is enough to guide ZIM; more points would overlap.
-        - LARGE (bbox >= 64px): box + 5 fg + 4 bg points → raw sigmoid or threshold.
-          Full rich prompts with soft Gaussian attention for smooth edges.
+        Key insight: set_image() (encoder) is ~80% of cost. predict() (decoder) is cheap.
+        After one set_image(), predict() can be called many times.
 
-        mask_threshold controls output:
-        - 0.0 = raw sigmoid (smooth [0,1] alpha, soft edges)
-        - 0.5 = crisp binary (best for small gems, clean overlay)
-        - in between = partial: soft above threshold, hard below
+        - Tiny+Small (<64px): grouped into 1024×1024 tiles. One set_image() per tile,
+          then predict() for each box in that tile. ~5x faster than per-crop.
+        - Large (>=64px): per-crop for max quality (gem fills ZIM's 1024 internal space).
+          Few of them, so per-crop is still fast.
+        """
+        t0 = time.time()
+
+        # Classify boxes by size
+        large_boxes = []
+        tile_boxes = []
+        for box in boxes:
+            bbox_size = max(box[2].item() - box[0].item(), box[3].item() - box[1].item())
+            if bbox_size >= self._SMALL_BBOX_PX:
+                large_boxes.append(box)
+            else:
+                tile_boxes.append(box)
+
+        logger.info("[ZIM] Hybrid: %d tile-batch (tiny+small) + %d per-crop (large), threshold=%.2f",
+                    len(tile_boxes), len(large_boxes), mask_threshold)
+
+        unified_mask = torch.zeros(H, W, dtype=torch.float32)
+
+        # Phase 1: tile-batch for tiny+small gems
+        if tile_boxes:
+            tile_mask = self._segment_tile_batch(
+                zim_predictor, np_img, tile_boxes, H, W, mask_threshold)
+            unified_mask = torch.max(unified_mask, tile_mask)
+
+        # Phase 2: per-crop for large gems
+        if large_boxes:
+            crop_mask = self._segment_per_crop(
+                zim_predictor, np_img, large_boxes, H, W, mask_threshold)
+            unified_mask = torch.max(unified_mask, crop_mask)
+
+        logger.info("[ZIM] Done %d objects in %.2fs (tile-batch=%d, per-crop=%d)",
+                    len(boxes), time.time() - t0, len(tile_boxes), len(large_boxes))
+        return unified_mask.clamp(0, 1)
+
+    @staticmethod
+    def _assign_boxes_to_tiles(tiles: list[tuple[int, int, int, int]],
+                                boxes: list[torch.Tensor],
+                                min_margin: int = 32) -> dict[int, list[int]]:
+        """Assign each box to exactly one tile (most centered).
+
+        Each box goes to the tile where it's most centered, with at least
+        min_margin context on each side. If no tile fully contains the box,
+        falls back to tile with max overlap. This avoids duplicate masks.
+        """
+        tile_to_boxes: dict[int, list[int]] = {}
+        for box_idx, box in enumerate(boxes):
+            bx1, by1 = box[0].item(), box[1].item()
+            bx2, by2 = box[2].item(), box[3].item()
+            bcx, bcy = (bx1 + bx2) / 2, (by1 + by2) / 2
+
+            best_tile = -1
+            best_dist = float('inf')
+
+            for t_idx, (tx1, ty1, tx2, ty2) in enumerate(tiles):
+                # Check box fully inside tile with margin
+                if (bx1 >= tx1 + min_margin and by1 >= ty1 + min_margin and
+                        bx2 <= tx2 - min_margin and by2 <= ty2 - min_margin):
+                    tcx, tcy = (tx1 + tx2) / 2, (ty1 + ty2) / 2
+                    dist = abs(bcx - tcx) + abs(bcy - tcy)
+                    if dist < best_dist:
+                        best_dist = dist
+                        best_tile = t_idx
+
+            if best_tile < 0:
+                # Fallback: tile with max overlap
+                best_overlap = 0
+                for t_idx, (tx1, ty1, tx2, ty2) in enumerate(tiles):
+                    ow = max(0, min(bx2, tx2) - max(bx1, tx1))
+                    oh = max(0, min(by2, ty2) - max(by1, ty1))
+                    overlap = ow * oh
+                    if overlap > best_overlap:
+                        best_overlap = overlap
+                        best_tile = t_idx
+
+            tile_to_boxes.setdefault(best_tile, []).append(box_idx)
+        return tile_to_boxes
+
+    def _segment_tile_batch(self, zim_predictor, np_img: np.ndarray,
+                             boxes: list[torch.Tensor], H: int, W: int,
+                             mask_threshold: float) -> torch.Tensor:
+        """Tile-batch ZIM for tiny+small gems.
+
+        One set_image() per tile (encoder), many predict() per tile (decoder).
+        ~5x faster than per-crop for 200+ small gems.
         """
         t0 = time.time()
         unified_mask = torch.zeros(H, W, dtype=torch.float32)
 
-        n_tiny = sum(1 for b in boxes if max(b[2].item()-b[0].item(), b[3].item()-b[1].item()) < self._TINY_BBOX_PX)
-        n_small = sum(1 for b in boxes if self._TINY_BBOX_PX <= max(b[2].item()-b[0].item(), b[3].item()-b[1].item()) < self._SMALL_BBOX_PX)
-        n_large = len(boxes) - n_tiny - n_small
-        logger.info("[ZIM] Segmenting %d objects (tiny=%d small=%d large=%d, threshold=%.2f)",
-                    len(boxes), n_tiny, n_small, n_large, mask_threshold)
+        overlap_frac = self._ZIM_TILE_OVERLAP / self._ZIM_TILE_SIZE
+        tiles = self._get_tiles(H, W, self._ZIM_TILE_SIZE, overlap_frac)
+        tile_to_boxes = self._assign_boxes_to_tiles(tiles, boxes)
+
+        active_tiles = sorted(t for t in tile_to_boxes if tile_to_boxes[t])
+        logger.info("[ZIM-Tile] %d boxes across %d active tiles (of %d total)",
+                    len(boxes), len(active_tiles), len(tiles))
+
+        boxes_done = 0
+        for t_idx in active_tiles:
+            mm.throw_exception_if_processing_interrupted()
+
+            tx1, ty1, tx2, ty2 = tiles[t_idx]
+            tile_crop = np_img[ty1:ty2, tx1:tx2].copy()
+
+            # EXPENSIVE: one encoder run per active tile
+            zim_predictor.set_image(tile_crop)
+
+            # CHEAP: predict() for each box in this tile
+            for box_idx in tile_to_boxes[t_idx]:
+                box = boxes[box_idx]
+                bx1, by1 = box[0].item(), box[1].item()
+                bx2, by2 = box[2].item(), box[3].item()
+                bbox_size = max(bx2 - bx1, by2 - by1)
+
+                # Convert to tile-local coordinates
+                local_box = np.array([
+                    bx1 - tx1, by1 - ty1, bx2 - tx1, by2 - ty1
+                ], dtype=np.float32)
+                lx1, ly1, lx2, ly2 = local_box
+                cx, cy = (lx1 + lx2) / 2, (ly1 + ly2) / 2
+
+                # Size-adaptive prompt
+                if bbox_size < self._TINY_BBOX_PX:
+                    masks, iou_scores, _ = zim_predictor.predict(
+                        box=local_box, multimask_output=False)
+                    best_alpha = masks[0].astype(np.float32)
+                else:
+                    pt_coords = np.array([[cx, cy]], dtype=np.float32)
+                    pt_labels = np.array([1], dtype=np.int32)
+                    masks, iou_scores, _ = zim_predictor.predict(
+                        point_coords=pt_coords, point_labels=pt_labels,
+                        box=local_box, multimask_output=True)
+                    best_idx = int(np.argmax(iou_scores))
+                    best_alpha = masks[best_idx].astype(np.float32)
+
+                # Always binarize for small gems
+                best_alpha = (best_alpha > 0.5).astype(np.float32)
+
+                crop_alpha = torch.from_numpy(best_alpha)
+                unified_mask[ty1:ty2, tx1:tx2] = torch.max(
+                    unified_mask[ty1:ty2, tx1:tx2], crop_alpha)
+
+                boxes_done += 1
+
+            if boxes_done % 50 == 0 and boxes_done > 0:
+                logger.info("[ZIM-Tile] %d/%d boxes done", boxes_done, len(boxes))
+
+        logger.info("[ZIM-Tile] %d boxes in %.2fs (%d encoder runs)",
+                    len(boxes), time.time() - t0, len(active_tiles))
+        return unified_mask
+
+    def _segment_per_crop(self, zim_predictor, np_img: np.ndarray,
+                           boxes: list[torch.Tensor], H: int, W: int,
+                           mask_threshold: float) -> torch.Tensor:
+        """Per-crop ZIM for large gems. Max quality — gem fills ZIM's 1024 space."""
+        t0 = time.time()
+        unified_mask = torch.zeros(H, W, dtype=torch.float32)
 
         for idx, box in enumerate(boxes):
-            # Check for user interrupt every iteration
             mm.throw_exception_if_processing_interrupted()
 
             bx1, by1 = box[0].item(), box[1].item()
             bx2, by2 = box[2].item(), box[3].item()
+            bbox_size = max(bx2 - bx1, by2 - by1)
+            pad = int(max(15, min(60, bbox_size * 0.3)))
 
-            bbox_w = bx2 - bx1
-            bbox_h = by2 - by1
-            bbox_size = max(bbox_w, bbox_h)
-
-            # Adaptive padding: small gems get proportionally more padding
-            # so they fill more of ZIM's 1024×1024 internal resolution.
-            if bbox_size < self._TINY_BBOX_PX:
-                # Tiny: pad generously so the crop is at least ~80-100px
-                pad = max(30, int(bbox_size * 1.5))
-            elif bbox_size < self._SMALL_BBOX_PX:
-                # Small: moderate padding
-                pad = max(20, int(bbox_size * 0.5))
-            else:
-                # Large: 30% padding, clamped
-                pad = int(max(15, min(60, bbox_size * 0.3)))
-
-            # Crop around detection bbox with padding
             x1 = max(0, int(bx1) - pad)
             y1 = max(0, int(by1) - pad)
             x2 = min(W, int(bx2) + pad)
@@ -397,78 +522,41 @@ class SAM3Gemstone:
 
             local_box = np.array([bx1 - x1, by1 - y1, bx2 - x1, by2 - y1], dtype=np.float32)
             lx1, ly1, lx2, ly2 = local_box
-            cx = (lx1 + lx2) / 2
-            cy = (ly1 + ly2) / 2
+            cx, cy = (lx1 + lx2) / 2, (ly1 + ly2) / 2
+            qx = (lx2 - lx1) * 0.25
+            qy = (ly2 - ly1) * 0.25
+            crop_h, crop_w = y2 - y1, x2 - x1
+            bg_margin = max(5, int(bbox_size * 0.1))
 
-            # --- Size-adaptive prompt strategy ---
-            if bbox_size < self._TINY_BBOX_PX:
-                # TINY: box-only → hard binary attention in ZIM's 64×64 space.
-                # No points = no soft Gaussian bleed. multimask_output=False
-                # because box is unambiguous for a single small object.
-                masks, iou_scores, _ = zim_predictor.predict(
-                    box=local_box, multimask_output=False,
-                )
-                best_alpha = masks[0].astype(np.float32)
+            fg_points = [
+                [cx, cy],
+                [cx - qx, cy - qy], [cx + qx, cy - qy],
+                [cx - qx, cy + qy], [cx + qx, cy + qy],
+            ]
+            bg_points = [
+                [max(0, lx1 - bg_margin), cy],
+                [min(crop_w - 1, lx2 + bg_margin), cy],
+                [cx, max(0, ly1 - bg_margin)],
+                [cx, min(crop_h - 1, ly2 + bg_margin)],
+            ]
 
-            elif bbox_size < self._SMALL_BBOX_PX:
-                # SMALL: box + single center fg point.
-                # One Gaussian centered on the gem + box constraint.
-                pt_coords = np.array([[cx, cy]], dtype=np.float32)
-                pt_labels = np.array([1], dtype=np.int32)
-                masks, iou_scores, _ = zim_predictor.predict(
-                    point_coords=pt_coords, point_labels=pt_labels,
-                    box=local_box, multimask_output=True,
-                )
-                best_idx = int(np.argmax(iou_scores))
-                best_alpha = masks[best_idx].astype(np.float32)
+            pt_coords = np.array(fg_points + bg_points, dtype=np.float32)
+            pt_labels = np.array([1] * 5 + [0] * 4, dtype=np.int32)
+            masks, iou_scores, _ = zim_predictor.predict(
+                point_coords=pt_coords, point_labels=pt_labels,
+                box=local_box, multimask_output=True)
+            best_idx = int(np.argmax(iou_scores))
+            best_alpha = masks[best_idx].astype(np.float32)
 
-            else:
-                # LARGE: full rich prompts — 5 fg + 4 bg points.
-                qx = (lx2 - lx1) * 0.25
-                qy = (ly2 - ly1) * 0.25
-                crop_h, crop_w = y2 - y1, x2 - x1
-                bg_margin = max(5, int(bbox_size * 0.1))
-
-                fg_points = [
-                    [cx, cy],
-                    [cx - qx, cy - qy], [cx + qx, cy - qy],
-                    [cx - qx, cy + qy], [cx + qx, cy + qy],
-                ]
-                bg_points = [
-                    [max(0, lx1 - bg_margin), cy],
-                    [min(crop_w - 1, lx2 + bg_margin), cy],
-                    [cx, max(0, ly1 - bg_margin)],
-                    [cx, min(crop_h - 1, ly2 + bg_margin)],
-                ]
-
-                pt_coords = np.array(fg_points + bg_points, dtype=np.float32)
-                pt_labels = np.array([1] * 5 + [0] * 4, dtype=np.int32)
-                masks, iou_scores, _ = zim_predictor.predict(
-                    point_coords=pt_coords, point_labels=pt_labels,
-                    box=local_box, multimask_output=True,
-                )
-                best_idx = int(np.argmax(iou_scores))
-                best_alpha = masks[best_idx].astype(np.float32)
-
-            # --- Apply threshold ---
-            # For tiny/small gems, ALWAYS binarize (soft sigmoid bleeds outside).
-            # For large gems, respect user's mask_threshold setting.
-            if bbox_size < self._SMALL_BBOX_PX:
-                # Force binary for small objects — sigmoid too soft
-                best_alpha = (best_alpha > 0.5).astype(np.float32)
-            elif mask_threshold > 0.0:
+            if mask_threshold > 0.0:
                 best_alpha = (best_alpha > mask_threshold).astype(np.float32)
-            # else: mask_threshold == 0.0 → keep raw sigmoid
 
             crop_alpha = torch.from_numpy(best_alpha)
             unified_mask[y1:y2, x1:x2] = torch.max(
                 unified_mask[y1:y2, x1:x2], crop_alpha)
 
-            if (idx + 1) % 50 == 0:
-                logger.info("[ZIM] %d/%d done", idx + 1, len(boxes))
-
-        logger.info("[ZIM] Segmented %d objects in %.2fs", len(boxes), time.time() - t0)
-        return unified_mask.clamp(0, 1)
+        logger.info("[ZIM-Crop] %d large objects in %.2fs", len(boxes), time.time() - t0)
+        return unified_mask
 
     # =====================================================================
     #  Helpers

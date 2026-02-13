@@ -1,3 +1,4 @@
 opencv-python-headless>=4.8.0
 torchvision
+sam3==0.1.2
 zim_anything

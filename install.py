@@ -16,7 +16,7 @@ def main():
         import sam3  # noqa: F401
     except ImportError:
         print("[SAM3-Gemstone] Installing sam3 package (--no-deps to protect existing torch/CUDA)...")
-        pip_install("--no-deps", "sam3>=0.1.2")
+        pip_install("--no-deps", "sam3==0.1.2")
 
     try:
         import cv2  # noqa: F401
@@ -40,7 +40,7 @@ def main():
             from segment_anything import SamPredictor  # noqa: F401
         except ImportError:
             print("[SAM3-Gemstone] Installing segment-anything (ZIM dependency)...")
-            pip_install("git+https://github.com/facebookresearch/segment-anything.git")
+            pip_install("git+https://github.com/facebookresearch/segment-anything.git@6fdee8f2727f4506cfbbe553e23b895e27956588")
         pip_install("--no-deps", "zim_anything")
 
     print("[SAM3-Gemstone] Dependencies OK.")

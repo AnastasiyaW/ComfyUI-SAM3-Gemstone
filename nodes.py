@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import os
 import time
 import types
@@ -66,7 +68,7 @@ TILE_PROMPTS = ["diamond", "gemstone"]
 # ---------------------------------------------------------------------------
 # Shared helper: load ZIM model (used by SAM3Gemstone + ZIMRefineMask)
 # ---------------------------------------------------------------------------
-def _load_zim_model():
+def _load_zim_model() -> "ZimPredictor":
     """Load or return cached ZIM predictor."""
     if "zim" in _zim_cache:
         logger.info("[ZIM] Returning cached predictor")
@@ -143,6 +145,14 @@ class SAM3Gemstone:
                     "default": True,
                     "tooltip": "Refine each detection's edges with ZIM (pixel-perfect alpha matting)",
                 }),
+                "score_threshold": ("FLOAT", {
+                    "default": 0.10, "min": 0.01, "max": 1.0, "step": 0.01,
+                    "tooltip": "Minimum confidence score to keep a detection",
+                }),
+                "nms_iou_threshold": ("FLOAT", {
+                    "default": 0.50, "min": 0.1, "max": 1.0, "step": 0.05,
+                    "tooltip": "NMS IoU overlap threshold — lower = more aggressive dedup",
+                }),
             },
         }
 
@@ -155,13 +165,13 @@ class SAM3Gemstone:
     # =====================================================================
     #  SAM3 Model loading — returns ModelPatcher + processor
     # =====================================================================
-    def _load_model(self, compile_model: bool):
+    def _load_model(self) -> dict:
         t0 = time.time()
         device = mm.get_torch_device()
         offload_device = mm.unet_offload_device()
 
         logger.info("=" * 60)
-        logger.info("LOAD START  device=%s  offload=%s  compile=%s", device, offload_device, compile_model)
+        logger.info("LOAD START  device=%s  offload=%s", device, offload_device)
 
         if device.type != "cuda":
             raise RuntimeError(
@@ -173,7 +183,7 @@ class SAM3Gemstone:
         logger.info("GPU: %s  (compute %d.%d, %.1f GB VRAM)",
                     prop.name, prop.major, prop.minor, vram_bytes / (1024 ** 3))
 
-        cache_key = f"sam3_{compile_model}"
+        cache_key = "sam3"
         if cache_key in _sam3_cache:
             logger.info("Returning cached model (key=%s)", cache_key)
             return _sam3_cache[cache_key]
@@ -222,7 +232,7 @@ class SAM3Gemstone:
             device="cpu",
             checkpoint_path=ckpt_path,
             load_from_HF=False,
-            compile=compile_model,
+            compile=False,
         )
         model = model.to(dtype=torch.float32)
         model.eval()
@@ -231,10 +241,15 @@ class SAM3Gemstone:
         # ModelPatcher needs to set model.device during offload/load cycles.
         # Add a setter that writes to _device (which the getter already reads).
         cls = type(model)
-        if isinstance(getattr(cls, "device", None), property):
+        device_attr = getattr(cls, "device", None)
+        if isinstance(device_attr, property) and device_attr.fset is None:
             old_prop = cls.device
             cls.device = property(old_prop.fget, lambda self, val: setattr(self, "_device", val))
             logger.info("Patched Sam3Image.device: added setter for ModelPatcher compatibility")
+        elif isinstance(device_attr, property) and device_attr.fset is not None:
+            logger.info("Sam3Image.device already has a setter — no patch needed")
+        else:
+            logger.warning("Sam3Image.device is not a property — monkey-patch skipped, ModelPatcher may fail")
 
         logger.info("Model built on CPU, wrapping in ModelPatcher...")
 
@@ -286,8 +301,12 @@ class SAM3Gemstone:
             state["scores"] = out_probs
             return state
 
-        processor._forward_grounding = types.MethodType(_forward_grounding_no_presence, processor)
-        logger.info("Patched Sam3Processor: presence_logit_dec multiplier DISABLED")
+        if hasattr(processor, '_forward_grounding'):
+            processor._forward_grounding = types.MethodType(_forward_grounding_no_presence, processor)
+            logger.info("Patched Sam3Processor: presence_logit_dec multiplier DISABLED")
+        else:
+            logger.warning("Sam3Processor has no _forward_grounding — "
+                           "presence_logit_dec bypass skipped (sam3 API may have changed)")
 
         pipe = {"patcher": patcher, "processor": processor}
         _sam3_cache[cache_key] = pipe
@@ -299,8 +318,9 @@ class SAM3Gemstone:
     #  ZIM segmentation — smooth alpha edges via guided filter + Gaussian
     # =====================================================================
     @staticmethod
-    def _smooth_alpha(alpha_np, crop_rgb, guide_radius=8, guide_eps=0.01,
-                      blur_ksize=5, blur_sigma=0.8):
+    def _smooth_alpha(alpha_np: np.ndarray, crop_rgb: np.ndarray,
+                      guide_radius: int = 8, guide_eps: float = 0.01,
+                      blur_ksize: int = 5, blur_sigma: float = 0.8) -> np.ndarray:
         """Smooth ZIM alpha edges using guided filter + edge-band Gaussian.
 
         1. Guided filter: smooths alpha respecting RGB edges (like Adobe Refine Edge)
@@ -332,7 +352,8 @@ class SAM3Gemstone:
 
         return np.clip(result, 0, 1).astype(np.float32)
 
-    def _segment_with_zim(self, zim_predictor, np_img, boxes, H, W):
+    def _segment_with_zim(self, zim_predictor, np_img: np.ndarray,
+                          boxes: list[torch.Tensor], H: int, W: int) -> torch.Tensor:
         """Segment each detection with ZIM alpha matting (no SAM3 masks needed).
 
         SAM3 is used as detector only — provides boxes. ZIM crops around each
@@ -341,7 +362,8 @@ class SAM3Gemstone:
         Post-processing: guided filter + edge-band Gaussian for smooth edges.
         """
         t0 = time.time()
-        PAD = 30
+        MIN_PAD = 15
+        MAX_PAD = 60
         unified_mask = torch.zeros(H, W, dtype=torch.float32)
 
         logger.info("[ZIM] Segmenting %d objects (crop per box, smooth edges)", len(boxes))
@@ -350,11 +372,15 @@ class SAM3Gemstone:
             bx1, by1 = box[0].item(), box[1].item()
             bx2, by2 = box[2].item(), box[3].item()
 
+            # Adaptive padding: 30% of bbox size, clamped to [MIN_PAD, MAX_PAD]
+            bbox_size = max(bx2 - bx1, by2 - by1)
+            pad = int(max(MIN_PAD, min(MAX_PAD, bbox_size * 0.3)))
+
             # Crop around detection bbox with padding
-            x1 = max(0, int(bx1) - PAD)
-            y1 = max(0, int(by1) - PAD)
-            x2 = min(W, int(bx2) + PAD)
-            y2 = min(H, int(by2) + PAD)
+            x1 = max(0, int(bx1) - pad)
+            y1 = max(0, int(by1) - pad)
+            x2 = min(W, int(bx2) + pad)
+            y2 = min(H, int(by2) + pad)
 
             crop = np_img[y1:y2, x1:x2].copy()
             zim_predictor.set_image(crop)
@@ -399,23 +425,20 @@ class SAM3Gemstone:
     #  Helpers
     # =====================================================================
     @staticmethod
-    def _get_tiles(H: int, W: int, tile_size: int, overlap: float) -> list:
+    def _get_tiles(H: int, W: int, tile_size: int, overlap: float) -> list[tuple[int, int, int, int]]:
         step = int(tile_size * (1 - overlap))
-        tiles = []
-        seen = set()
+        seen: dict[tuple[int, int, int, int], None] = {}
         for y in range(0, H, step):
             for x in range(0, W, step):
                 x2 = min(x + tile_size, W)
                 y2 = min(y + tile_size, H)
                 x1 = max(0, x2 - tile_size)
                 y1 = max(0, y2 - tile_size)
-                key = (x1, y1, x2, y2)
-                if key not in seen:
-                    seen.add(key)
-                    tiles.append(key)
-        return tiles
+                seen.setdefault((x1, y1, x2, y2), None)
+        return list(seen.keys())
 
-    def _run_prompts(self, processor, state, prompts, max_per_prompt=50):
+    def _run_prompts(self, processor, state: dict, prompts: list[str],
+                     max_per_prompt: int = 50) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
         """Run multiple prompts on cached image state.
 
         Returns (boxes, scores) lists — NO masks stored.
@@ -466,7 +489,7 @@ class SAM3Gemstone:
 
         return all_boxes, all_scores
 
-    def _compute_stats(self, mask: torch.Tensor, H: int, W: int) -> tuple:
+    def _compute_stats(self, mask: torch.Tensor, H: int, W: int) -> tuple[int, float]:
         binary = (mask > 0.5).cpu().numpy().astype(np.uint8)
         total_pixels = H * W
         coverage = binary.sum() / total_pixels * 100
@@ -484,21 +507,18 @@ class SAM3Gemstone:
         tile_prompts: str,
         sahi_tile_size: int,
         use_zim_refinement: bool,
+        score_threshold: float = 0.10,
+        nms_iou_threshold: float = 0.50,
     ):
         t0 = time.time()
 
-        # Hardcoded sensible defaults
-        score_threshold = 0.10
-        nms_iou_threshold = 0.50
         min_area_pct = 0.001
         max_area_pct = 15.0
         max_detections = 512
         enable_sahi = True
         sahi_overlap = 0.3
-        compile_model = False
-
         # --- Load / get cached model + processor ---
-        pipe = self._load_model(compile_model)
+        pipe = self._load_model()
         patcher = pipe["patcher"]
         processor = pipe["processor"]
 
@@ -605,12 +625,13 @@ class SAM3Gemstone:
         return (overlay_batch, mask_batch, cropped_batch, stats_text, total_gems, round(avg_coverage, 2))
 
     def _process_single_image(
-        self, img_tensor_single, processor, device, prompts, tile_prompts, H, W,
-        score_threshold, nms_iou_threshold,
-        min_area_pct, max_area_pct, max_detections,
-        enable_sahi, sahi_tile_size, sahi_overlap,
+        self, img_tensor_single: torch.Tensor, processor, device: torch.device,
+        prompts: list[str], tile_prompts: list[str], H: int, W: int,
+        score_threshold: float, nms_iou_threshold: float,
+        min_area_pct: float, max_area_pct: float, max_detections: int,
+        enable_sahi: bool, sahi_tile_size: int, sahi_overlap: float,
         zim_predictor,
-    ):
+    ) -> torch.Tensor:
         """Process one image. SAM3 = detector (boxes only), ZIM = segmentor (alpha).
 
         Pipeline: SAM3 prompts → boxes + scores → NMS → area filter →
@@ -772,7 +793,8 @@ class ZIMRefineMask:
     CATEGORY = "SAM3-Gemstone"
 
     @staticmethod
-    def _mask_to_points(obj_mask_u8, bx1, by1, bx2, by2, H, W, n_bg=4):
+    def _mask_to_points(obj_mask_u8: np.ndarray, bx1: int, by1: int, bx2: int, by2: int,
+                        H: int, W: int, n_bg: int = 4) -> tuple[np.ndarray | None, np.ndarray | None]:
         """Extract point prompts from binary mask for ZIM.
         Returns (point_coords Nx2, point_labels N) or (None, None)."""
         ys, xs = np.where(obj_mask_u8 > 0)
@@ -1121,9 +1143,13 @@ class GemstoneInpaintStitch:
             if blend_mask is not None:
                 if blend_mask.ndim == 3:
                     alpha = blend_mask[0]
+                elif blend_mask.ndim == 4:
+                    alpha = blend_mask[0, :, :, 0]
                 else:
                     alpha = blend_mask
                 if alpha.shape[0] != bh or alpha.shape[1] != bw:
+                    logger.info("[InpaintStitch] Resizing blend_mask from %dx%d to %dx%d",
+                                alpha.shape[1], alpha.shape[0], bw, bh)
                     alpha = torch.nn.functional.interpolate(
                         alpha.unsqueeze(0).unsqueeze(0).float(),
                         size=(bh, bw), mode="bilinear", align_corners=False,

@@ -138,7 +138,7 @@ class SAM3Gemstone:
                     "tooltip": "Subset of prompts for tiles (speed). Default: diamond + gemstone.",
                 }),
                 "sahi_tile_size": ("INT", {
-                    "default": 512, "min": 256, "max": 2048, "step": 128,
+                    "default": 384, "min": 256, "max": 2048, "step": 128,
                 }),
                 "use_zim_refinement": ("BOOLEAN", {
                     "default": True,
@@ -350,131 +350,82 @@ class SAM3Gemstone:
         return np.array(coords, dtype=np.float32), np.array(labels, dtype=np.int32)
 
     def _refine_with_zim(self, zim_predictor, np_img, surviving, all_boxes, all_logits, H, W):
+        """Refine each surviving detection with ZIM alpha matting.
+
+        ALWAYS crops around each object's bbox+padding before calling ZIM.
+        ZIM internally resizes to 1024x1024 — on a 4000px image a 10px
+        gemstone would become ~2.5px (invisible). Cropping ensures every
+        object fills enough of ZIM's input for pixel-perfect edges.
+        SAM3 mask provides point prompts: centroid=foreground, box corners=background.
+        """
         t0 = time.time()
-        image_area = H * W
         refined_logits = {}
 
         BAND_OUTER = 10
         ZIM_MIN_COVERAGE = 0.10
+        PAD = 30  # crop padding around bbox
 
-        small_indices = []
-        large_indices = []
-        for gi in surviving:
+        logger.info("[ZIM] Refining %d objects (all via crop for max resolution)", len(surviving))
+
+        for idx, gi in enumerate(surviving):
             box = all_boxes[gi]
-            bw = (box[2] - box[0]).item()
-            bh = (box[3] - box[1]).item()
-            box_area_pct = (bw * bh) / image_area * 100
-            if box_area_pct >= ZIM_LARGE_OBJECT_PCT:
-                large_indices.append(gi)
+
+            # Crop around detection bbox with padding
+            x1 = max(0, int(box[0].item()) - PAD)
+            y1 = max(0, int(box[1].item()) - PAD)
+            x2 = min(W, int(box[2].item()) + PAD)
+            y2 = min(H, int(box[3].item()) + PAD)
+
+            crop = np_img[y1:y2, x1:x2].copy()
+            zim_predictor.set_image(crop)
+
+            local_box = np.array([
+                box[0].item() - x1, box[1].item() - y1,
+                box[2].item() - x1, box[3].item() - y1,
+            ], dtype=np.float32)
+
+            # Get SAM3 mask for this detection
+            sam3_mask = all_logits[gi]
+            if isinstance(sam3_mask, torch.Tensor):
+                sam3_np = (sam3_mask.numpy() > 0.5).astype(np.uint8)
             else:
-                small_indices.append(gi)
+                sam3_np = (sam3_mask > 0.5).astype(np.uint8) if isinstance(sam3_mask, np.ndarray) else np.zeros((H, W), dtype=np.uint8)
 
-        logger.info("[ZIM] %d small + %d large objects to refine", len(small_indices), len(large_indices))
+            # Build point prompts from SAM3 mask in crop-local coordinates
+            local_sam3 = sam3_np[y1:y2, x1:x2]
+            crop_h, crop_w = y2 - y1, x2 - x1
+            local_box_for_pts = torch.tensor([
+                box[0].item() - x1, box[1].item() - y1,
+                box[2].item() - x1, box[3].item() - y1,
+            ])
+            pt_coords, pt_labels = self._sam3_mask_to_points(
+                local_sam3, local_box_for_pts, crop_h, crop_w)
 
-        if small_indices:
-            t_enc = time.time()
-            zim_predictor.set_image(np_img)
-            logger.info("[ZIM] Full-image encoder: %.2fs", time.time() - t_enc)
+            if pt_coords is not None:
+                masks, scores, _ = zim_predictor.predict(
+                    point_coords=pt_coords, point_labels=pt_labels,
+                    box=local_box, multimask_output=False,
+                )
+            else:
+                masks, scores, _ = zim_predictor.predict(box=local_box, multimask_output=False)
 
-            for idx, gi in enumerate(small_indices):
-                box = all_boxes[gi]
-                bbox_np = np.array([box[0].item(), box[1].item(),
-                                    box[2].item(), box[3].item()], dtype=np.float32)
+            # Map crop alpha back to full image
+            full_zim = np.zeros((H, W), dtype=np.float32)
+            full_zim[y1:y2, x1:x2] = masks[0].astype(np.float32)
 
-                sam3_mask = all_logits[gi]
-                if isinstance(sam3_mask, torch.Tensor):
-                    sam3_np = (sam3_mask.numpy() > 0.5).astype(np.uint8)
-                else:
-                    sam3_np = (sam3_mask > 0.5).astype(np.uint8) if isinstance(sam3_mask, np.ndarray) else np.zeros((H, W), dtype=np.uint8)
+            obj_coverage = (full_zim * sam3_np).sum() / max(sam3_np.sum(), 1)
+            if obj_coverage < ZIM_MIN_COVERAGE:
+                logger.debug("  [ZIM] det %d: coverage %.1f%% → FALLBACK to SAM3", gi, obj_coverage * 100)
+                continue
 
-                # Build point prompts from SAM3 mask
-                pt_coords, pt_labels = self._sam3_mask_to_points(sam3_np, box, H, W)
+            # Use ZIM alpha directly — constrain to dilated SAM3 zone
+            kern = cv2.getStructuringElement(
+                cv2.MORPH_ELLIPSE, (BAND_OUTER * 2 + 1, BAND_OUTER * 2 + 1))
+            obj_zone = cv2.dilate(sam3_np, kern, iterations=1).astype(np.float32)
+            refined_logits[gi] = torch.from_numpy((full_zim * obj_zone).clip(0, 1))
 
-                if pt_coords is not None:
-                    masks, scores, _ = zim_predictor.predict(
-                        point_coords=pt_coords, point_labels=pt_labels,
-                        box=bbox_np, multimask_output=False,
-                    )
-                else:
-                    masks, scores, _ = zim_predictor.predict(box=bbox_np, multimask_output=False)
-
-                zim_alpha = masks[0].astype(np.float32)
-
-                obj_coverage = (zim_alpha * sam3_np).sum() / max(sam3_np.sum(), 1)
-                if obj_coverage < ZIM_MIN_COVERAGE:
-                    logger.debug("  [ZIM] det %d: coverage %.1f%% → FALLBACK to SAM3", gi, obj_coverage * 100)
-                    continue
-
-                # Use ZIM alpha directly — constrain to dilated SAM3 zone
-                kern = cv2.getStructuringElement(
-                    cv2.MORPH_ELLIPSE, (BAND_OUTER * 2 + 1, BAND_OUTER * 2 + 1))
-                obj_zone = cv2.dilate(sam3_np, kern, iterations=1).astype(np.float32)
-                refined_logits[gi] = torch.from_numpy((zim_alpha * obj_zone).clip(0, 1))
-
-                if (idx + 1) % 50 == 0:
-                    logger.info("[ZIM] Small: %d/%d done", idx + 1, len(small_indices))
-
-            logger.info("[ZIM] %d small objects: %.2fs", len(small_indices), time.time() - t_enc)
-
-        if large_indices:
-            t_large = time.time()
-            pad = 20
-
-            for gi in large_indices:
-                box = all_boxes[gi]
-                x1 = max(0, int(box[0].item()) - pad)
-                y1 = max(0, int(box[1].item()) - pad)
-                x2 = min(W, int(box[2].item()) + pad)
-                y2 = min(H, int(box[3].item()) + pad)
-
-                crop = np_img[y1:y2, x1:x2].copy()
-                zim_predictor.set_image(crop)
-
-                local_box = np.array([
-                    box[0].item() - x1, box[1].item() - y1,
-                    box[2].item() - x1, box[3].item() - y1,
-                ], dtype=np.float32)
-
-                sam3_mask = all_logits[gi]
-                if isinstance(sam3_mask, torch.Tensor):
-                    sam3_np = (sam3_mask.numpy() > 0.5).astype(np.uint8)
-                else:
-                    sam3_np = np.zeros((H, W), dtype=np.uint8)
-
-                # Build point prompts in crop-local coordinates
-                local_sam3 = sam3_np[y1:y2, x1:x2]
-                crop_h, crop_w = y2 - y1, x2 - x1
-                # Shift box to local coords for point generation
-                local_box_for_pts = torch.tensor([
-                    box[0].item() - x1, box[1].item() - y1,
-                    box[2].item() - x1, box[3].item() - y1,
-                ])
-                pt_coords, pt_labels = self._sam3_mask_to_points(
-                    local_sam3, local_box_for_pts, crop_h, crop_w)
-
-                if pt_coords is not None:
-                    masks, scores, _ = zim_predictor.predict(
-                        point_coords=pt_coords, point_labels=pt_labels,
-                        box=local_box, multimask_output=False,
-                    )
-                else:
-                    masks, scores, _ = zim_predictor.predict(box=local_box, multimask_output=False)
-
-                full_zim = np.zeros((H, W), dtype=np.float32)
-                full_zim[y1:y2, x1:x2] = masks[0].astype(np.float32)
-
-                obj_coverage = (full_zim * sam3_np).sum() / max(sam3_np.sum(), 1)
-                if obj_coverage < ZIM_MIN_COVERAGE:
-                    logger.debug("  [ZIM] large det %d: coverage %.1f%% → FALLBACK", gi, obj_coverage * 100)
-                    continue
-
-                # Use ZIM alpha directly — constrain to dilated SAM3 zone
-                kern = cv2.getStructuringElement(
-                    cv2.MORPH_ELLIPSE, (BAND_OUTER * 2 + 1, BAND_OUTER * 2 + 1))
-                obj_zone = cv2.dilate(sam3_np, kern, iterations=1).astype(np.float32)
-                refined_logits[gi] = torch.from_numpy((full_zim * obj_zone).clip(0, 1))
-
-            logger.info("[ZIM] %d large objects: %.2fs", len(large_indices), time.time() - t_large)
+            if (idx + 1) % 50 == 0:
+                logger.info("[ZIM] %d/%d done", idx + 1, len(surviving))
 
         logger.info("[ZIM] Total refinement: %.2fs for %d objects (refined %d)",
                     time.time() - t0, len(surviving), len(refined_logits))
@@ -601,7 +552,7 @@ class SAM3Gemstone:
         score_threshold = 0.10
         nms_iou_threshold = 0.50
         min_solidity = 0.30
-        min_area_pct = 0.005
+        min_area_pct = 0.001
         max_area_pct = 15.0
         max_detections = 128
         mask_expansion = 0
@@ -1015,60 +966,27 @@ class ZIMRefineMask:
                         len(small_objects), len(large_objects), skipped_tiny, min_object_area)
 
             # ---------------------------------------------------------------
-            # Strategy: Use ZIM alpha DIRECTLY as the mask for each object.
-            # ZIM produces pixel-perfect edges natively.
-            # If ZIM doesn't find object (low coverage) → keep SAM3 mask.
+            # Strategy: ALWAYS crop around each object for ZIM.
+            # ZIM internally resizes to 1024x1024 — on a 4000px image a
+            # 10px gemstone becomes ~2.5px, invisible. By cropping around
+            # the bbox+padding, even tiny objects fill enough of ZIM's
+            # input resolution for pixel-perfect alpha edges.
+            # Mask-derived point prompts (centroid=fg, box corners=bg)
+            # guide ZIM to the exact object.
             # ---------------------------------------------------------------
             unified_alpha = np.zeros((H, W), dtype=np.float32)
 
             zim_refined = 0
             zim_fallback = 0
 
-            if small_objects:
-                t_small = time.time()
-                predictor.set_image(np_img)
+            all_objects = small_objects + large_objects
+            if all_objects:
+                t_refine = time.time()
 
-                for idx, (label_id, x1, y1, x2, y2) in enumerate(small_objects):
-                    bbox_np = np.array([x1, y1, x2, y2], dtype=np.float32)
+                for idx, (label_id, x1, y1, x2, y2) in enumerate(all_objects):
                     obj_mask_u8 = (labels == label_id).astype(np.uint8)
 
-                    # Build point prompts from input mask (centroid + bg corners)
-                    pt_coords, pt_labels = self._mask_to_points(obj_mask_u8, x1, y1, x2, y2, H, W)
-                    if pt_coords is not None:
-                        masks_out, scores, _ = predictor.predict(
-                            point_coords=pt_coords, point_labels=pt_labels,
-                            box=bbox_np, multimask_output=False)
-                    else:
-                        masks_out, scores, _ = predictor.predict(box=bbox_np, multimask_output=False)
-                    zim_alpha = masks_out[0].astype(np.float32)
-
-                    # Check if ZIM found something meaningful in this object's area
-                    obj_coverage = (zim_alpha * obj_mask_u8).sum() / max(obj_mask_u8.sum(), 1)
-
-                    if obj_coverage < zim_min_coverage:
-                        # ZIM didn't find it → use original mask for this object
-                        zim_fallback += 1
-                        unified_alpha = np.maximum(unified_alpha, obj_mask_u8.astype(np.float32))
-                        logger.debug("  [ZIM] obj %d: coverage %.1f%% → FALLBACK",
-                                     label_id, obj_coverage * 100)
-                        continue
-
-                    # Use ZIM alpha directly — its edges are pixel-perfect
-                    # Constrain to dilated object region to avoid ZIM bleeding into neighbors
-                    kern = cv2.getStructuringElement(
-                        cv2.MORPH_ELLIPSE, (band_outer * 2 + 1, band_outer * 2 + 1))
-                    obj_zone = cv2.dilate(obj_mask_u8, kern, iterations=1).astype(np.float32)
-                    unified_alpha = np.maximum(unified_alpha, zim_alpha * obj_zone)
-                    zim_refined += 1
-
-                    if (idx + 1) % 50 == 0:
-                        logger.info("[ZIM-Refine] Small: %d/%d done", idx + 1, len(small_objects))
-
-                logger.info("[ZIM-Refine] %d small: %.2fs", len(small_objects), time.time() - t_small)
-
-            if large_objects:
-                t_large = time.time()
-                for label_id, x1, y1, x2, y2 in large_objects:
+                    # Crop around object with padding — maximizes resolution for ZIM
                     cx1 = max(0, x1 - crop_padding)
                     cy1 = max(0, y1 - crop_padding)
                     cx2 = min(W, x2 + crop_padding)
@@ -1078,13 +996,13 @@ class ZIMRefineMask:
                     predictor.set_image(crop)
 
                     local_box = np.array([x1 - cx1, y1 - cy1, x2 - cx1, y2 - cy1], dtype=np.float32)
-                    obj_mask_u8 = (labels == label_id).astype(np.uint8)
 
                     # Build point prompts in crop-local coordinates
                     local_mask = obj_mask_u8[cy1:cy2, cx1:cx2]
                     crop_h, crop_w = cy2 - cy1, cx2 - cx1
                     pt_coords, pt_labels = self._mask_to_points(
                         local_mask, x1 - cx1, y1 - cy1, x2 - cx1, y2 - cy1, crop_h, crop_w)
+
                     if pt_coords is not None:
                         masks_out, scores, _ = predictor.predict(
                             point_coords=pt_coords, point_labels=pt_labels,
@@ -1097,23 +1015,27 @@ class ZIMRefineMask:
                     full_zim_alpha = np.zeros((H, W), dtype=np.float32)
                     full_zim_alpha[cy1:cy2, cx1:cx2] = crop_alpha
 
+                    # Check if ZIM found something meaningful in this object's area
                     obj_coverage = (full_zim_alpha * obj_mask_u8).sum() / max(obj_mask_u8.sum(), 1)
 
                     if obj_coverage < zim_min_coverage:
                         zim_fallback += 1
                         unified_alpha = np.maximum(unified_alpha, obj_mask_u8.astype(np.float32))
-                        logger.debug("  [ZIM] large obj %d: coverage %.1f%% → FALLBACK",
+                        logger.debug("  [ZIM] obj %d: coverage %.1f%% → FALLBACK",
                                      label_id, obj_coverage * 100)
                         continue
 
-                    # Use ZIM alpha directly within dilated object zone
+                    # Use ZIM alpha directly — constrain to dilated object zone
                     kern = cv2.getStructuringElement(
                         cv2.MORPH_ELLIPSE, (band_outer * 2 + 1, band_outer * 2 + 1))
                     obj_zone = cv2.dilate(obj_mask_u8, kern, iterations=1).astype(np.float32)
                     unified_alpha = np.maximum(unified_alpha, full_zim_alpha * obj_zone)
                     zim_refined += 1
 
-                logger.info("[ZIM-Refine] %d large: %.2fs", len(large_objects), time.time() - t_large)
+                    if (idx + 1) % 50 == 0:
+                        logger.info("[ZIM-Refine] %d/%d done", idx + 1, len(all_objects))
+
+                logger.info("[ZIM-Refine] %d objects: %.2fs", len(all_objects), time.time() - t_refine)
 
             # Tiny objects that were skipped — add their original mask
             for label_id in range(1, num_labels):

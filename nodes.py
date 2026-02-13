@@ -706,6 +706,23 @@ class SAM3Gemstone:
                     mode="bilinear", align_corners=False,
                 ).squeeze(0).squeeze(0).sigmoid()
 
+                # SAM3 grounding masks may be inverted (background=high, object=low).
+                # Check first mask: if mean > 0.5 in bbox region, invert all masks.
+                if not _logged_shape:  # already True, so this won't run
+                    pass
+                if idx_val == surviving_indices[0]:
+                    box_check = all_boxes[idx_val]
+                    bc_x1 = max(0, int(box_check[0].item()) - tx1)
+                    bc_y1 = max(0, int(box_check[1].item()) - ty1)
+                    bc_x2 = min(tile_w, int(box_check[2].item()) - tx1)
+                    bc_y2 = min(tile_h, int(box_check[3].item()) - ty1)
+                    if bc_x2 > bc_x1 and bc_y2 > bc_y1:
+                        bbox_mean = mask_up[bc_y1:bc_y2, bc_x1:bc_x2].mean().item()
+                        full_mean = mask_up.mean().item()
+                        logger.info("[Merge] FIRST MASK: bbox_mean=%.3f, full_mean=%.3f "
+                                    "(if bbox_mean > 0.6 → masks likely inverted)",
+                                    bbox_mean, full_mean)
+
                 if mask_threshold > 0.0:
                     mask_up = (mask_up > mask_threshold).float()
 
@@ -809,6 +826,64 @@ class ZIMRefineMask:
     CATEGORY = "SAM3-Gemstone"
 
     @staticmethod
+    def _split_large_blob(blob_mask: np.ndarray, min_area: int, max_crop: int) -> list:
+        """Split a large connected component into smaller sub-objects.
+
+        Uses progressive erosion to separate touching/overlapping sub-objects,
+        then finds connected components in the eroded mask. Each sub-object
+        gets its bbox from the ERODED mask but the full original mask pixels
+        within that bbox region.
+
+        Returns list of (obj_mask_u8, x1, y1, x2, y2) tuples.
+        """
+        results = []
+        H, W = blob_mask.shape
+
+        # Try increasing erosion kernel sizes to split the blob
+        for kern_size in [3, 5, 9, 15, 25]:
+            kern = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kern_size, kern_size))
+            eroded = cv2.erode(blob_mask, kern, iterations=1)
+            n_labels, sub_labels = cv2.connectedComponents(eroded, connectivity=8)
+
+            if n_labels - 1 < 2:
+                continue  # Not enough splits yet
+
+            # Check if all sub-objects fit within max_crop
+            all_fit = True
+            sub_objects = []
+            for sid in range(1, n_labels):
+                ys, xs = np.where(sub_labels == sid)
+                if len(ys) < min_area:
+                    continue
+                sx1, sy1 = int(xs.min()), int(ys.min())
+                sx2, sy2 = int(xs.max()) + 1, int(ys.max()) + 1
+                if max(sx2 - sx1, sy2 - sy1) > max_crop:
+                    all_fit = False
+                # Use original (un-eroded) mask pixels within this sub-object's bbox region
+                # but only where original mask was 1 AND close to eroded region
+                sub_mask_dilated = np.zeros_like(blob_mask)
+                sub_mask_dilated[sub_labels == sid] = 1
+                # Dilate back to roughly original size
+                sub_mask_dilated = cv2.dilate(sub_mask_dilated, kern, iterations=1)
+                # Intersect with original mask
+                sub_mask_final = (sub_mask_dilated & blob_mask).astype(np.uint8)
+                fys, fxs = np.where(sub_mask_final > 0)
+                if len(fys) < min_area:
+                    continue
+                fx1, fy1 = int(fxs.min()), int(fys.min())
+                fx2, fy2 = int(fxs.max()) + 1, int(fys.max()) + 1
+                sub_objects.append((sub_mask_final, fx1, fy1, fx2, fy2))
+
+            if len(sub_objects) >= 2:
+                return sub_objects
+
+        # Could not split — return as single object with original mask
+        ys, xs = np.where(blob_mask > 0)
+        if len(ys) == 0:
+            return []
+        return [(blob_mask, int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1)]
+
+    @staticmethod
     def _mask_to_points(obj_mask_u8: np.ndarray, bx1: int, by1: int, bx2: int, by2: int,
                         H: int, W: int) -> tuple[np.ndarray | None, np.ndarray | None]:
         """Extract rich point prompts from binary mask for ZIM.
@@ -893,9 +968,11 @@ class ZIMRefineMask:
                 continue
 
             image_area = H * W
-            small_objects = []
-            large_objects = []
+            objects = []      # list of (obj_mask_u8, x1, y1, x2, y2)
             skipped_tiny = 0
+
+            # Max crop dimension for ZIM — larger crops lose detail
+            MAX_ZIM_CROP = 1024
 
             for label_id in range(1, num_labels):
                 ys, xs = np.where(labels == label_id)
@@ -905,34 +982,39 @@ class ZIMRefineMask:
                     continue
                 x1, y1 = int(xs.min()), int(ys.min())
                 x2, y2 = int(xs.max()) + 1, int(ys.max()) + 1
-                area_pct = obj_area / image_area * 100
-                if area_pct >= large_object_pct:
-                    large_objects.append((label_id, x1, y1, x2, y2))
-                else:
-                    small_objects.append((label_id, x1, y1, x2, y2))
+                bbox_w, bbox_h = x2 - x1, y2 - y1
 
-            logger.info("[ZIM-Refine] %d small + %d large (skipped %d tiny < %d px)",
-                        len(small_objects), len(large_objects), skipped_tiny, min_object_area)
+                # If object bbox is too large for ZIM (>MAX_ZIM_CROP), split it
+                # using erosion to separate touching sub-objects.
+                if max(bbox_w, bbox_h) > MAX_ZIM_CROP:
+                    obj_mask = (labels == label_id).astype(np.uint8)
+                    # Progressive erosion to split blobs
+                    split_objects = self._split_large_blob(obj_mask, min_object_area, MAX_ZIM_CROP)
+                    logger.info("[ZIM-Refine] Large blob %d (%dx%d, %d px) → split into %d sub-objects",
+                                label_id, bbox_w, bbox_h, obj_area, len(split_objects))
+                    objects.extend(split_objects)
+                else:
+                    obj_mask = (labels == label_id).astype(np.uint8)
+                    objects.append((obj_mask, x1, y1, x2, y2))
+
+            logger.info("[ZIM-Refine] %d objects total (skipped %d tiny < %d px)",
+                        len(objects), skipped_tiny, min_object_area)
 
             # ---------------------------------------------------------------
             # Strategy: crop around each object, let ZIM form the mask.
             # ZIM gets: image crop + fg/bg point prompts + bbox.
             # ZIM returns: soft alpha mask (sigmoid 0..1) with proper edges.
-            # We take ZIM's alpha AS IS in the crop region — no constraining
-            # to the original mask shape. ZIM IS the mask generator here.
+            # We take ZIM's alpha AS IS — ZIM IS the mask generator.
             # ---------------------------------------------------------------
             unified_alpha = np.zeros((H, W), dtype=np.float32)
 
             zim_refined = 0
-            zim_fallback = 0
 
-            all_objects = small_objects + large_objects
-            if all_objects:
+            if objects:
                 t_refine = time.time()
 
-                for idx, (label_id, x1, y1, x2, y2) in enumerate(all_objects):
+                for idx, (obj_mask_u8, x1, y1, x2, y2) in enumerate(objects):
                     mm.throw_exception_if_processing_interrupted()
-                    obj_mask_u8 = (labels == label_id).astype(np.uint8)
 
                     # Crop around object with padding — maximizes resolution for ZIM
                     cx1 = max(0, x1 - crop_padding)
@@ -964,26 +1046,25 @@ class ZIMRefineMask:
                     crop_alpha = masks_out[best_idx].astype(np.float32)
 
                     if idx < 5:
-                        logger.info("  [ZIM] obj %d: crop=%dx%d, box=[%d,%d,%d,%d], "
-                                    "best_iou=%.3f, alpha [%.3f..%.3f] mean=%.3f",
-                                    label_id, crop.shape[1], crop.shape[0],
+                        logger.info("  [ZIM] obj %d/%d: crop=%dx%d, box=[%d,%d,%d,%d], "
+                                    "best_iou=%.3f, alpha mean=%.3f",
+                                    idx + 1, len(objects),
+                                    crop.shape[1], crop.shape[0],
                                     int(local_box[0]), int(local_box[1]),
                                     int(local_box[2]), int(local_box[3]),
                                     float(iou_scores[best_idx]),
-                                    float(crop_alpha.min()), float(crop_alpha.max()),
                                     float(crop_alpha.mean()))
 
                     # ZIM forms the mask — take it AS IS in the crop region.
-                    # No constraining to original mask shape.
-                    # Just merge into unified alpha (max blend).
                     unified_alpha[cy1:cy2, cx1:cx2] = np.maximum(
                         unified_alpha[cy1:cy2, cx1:cx2], crop_alpha)
                     zim_refined += 1
 
                     if (idx + 1) % 50 == 0:
-                        logger.info("[ZIM-Refine] %d/%d done", idx + 1, len(all_objects))
+                        logger.info("[ZIM-Refine] %d/%d done (%.1fs)",
+                                    idx + 1, len(objects), time.time() - t_refine)
 
-                logger.info("[ZIM-Refine] %d objects in %.2fs", len(all_objects), time.time() - t_refine)
+                logger.info("[ZIM-Refine] %d objects in %.2fs", len(objects), time.time() - t_refine)
 
             # Tiny objects that were skipped — add their original mask
             for label_id in range(1, num_labels):
@@ -992,7 +1073,7 @@ class ZIMRefineMask:
                     unified_alpha = np.maximum(
                         unified_alpha, (labels == label_id).astype(np.float32))
 
-            logger.info("[ZIM-Refine] Refined: %d, Fallback: %d", zim_refined, zim_fallback)
+            logger.info("[ZIM-Refine] Refined: %d", zim_refined)
 
             refined_mask = torch.from_numpy(unified_alpha).clamp(0, 1)
 

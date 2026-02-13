@@ -42,6 +42,27 @@ _zim_cache: dict = {}
 
 ZIM_LARGE_OBJECT_PCT = 5.0
 
+# ---------------------------------------------------------------------------
+# Multi-prompt stone detection — ported from jewelry_segmenter.py
+# SAM3 works best with specific noun phrases, not generic "gemstone"
+# ---------------------------------------------------------------------------
+STONE_PROMPTS = [
+    # Core (catch most stones)
+    "gemstone", "diamond", "precious stone",
+    # Big 4
+    "emerald", "ruby", "sapphire",
+    # Popular semi-precious
+    "amethyst", "topaz", "opal", "garnet", "tourmaline",
+    "aquamarine", "tanzanite", "morganite", "peridot",
+    # Cut shapes (catch stones by shape, not type)
+    "marquise cut stone", "pear cut stone", "oval gemstone",
+    "round brilliant stone", "cushion cut stone",
+    # Generic fallback
+    "crystal", "transparent stone", "faceted stone",
+]
+# Subset for SAHI tiles (speed optimization — full prompt list is too slow per tile)
+TILE_PROMPTS = ["diamond", "gemstone"]
+
 
 # ---------------------------------------------------------------------------
 # Shared helper: load ZIM model (used by SAM3Gemstone + ZIMRefineMask)
@@ -178,7 +199,11 @@ class SAM3Gemstone:
                 "prompt": ("STRING", {
                     "default": "diamond",
                     "multiline": True,
-                    "placeholder": "One prompt per line. 'diamond' works best.",
+                    "placeholder": "Custom prompts (one per line). Ignored when use_stone_prompts=True.",
+                }),
+                "use_stone_prompts": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Use 22 built-in stone prompts (gem types + cut shapes). Much better detection than single 'diamond'.",
                 }),
                 "score_threshold": ("FLOAT", {
                     "default": 0.10, "min": 0.01, "max": 1.0, "step": 0.01,
@@ -587,6 +612,7 @@ class SAM3Gemstone:
         self,
         image: torch.Tensor,
         prompt: str,
+        use_stone_prompts: bool,
         score_threshold: float,
         nms_iou_threshold: float,
         min_solidity: float,
@@ -632,9 +658,15 @@ class SAM3Gemstone:
         logger.info("=" * 60)
 
         # Resolve prompts
-        prompts = [p.strip() for p in prompt.strip().splitlines() if p.strip()]
-        if not prompts:
-            prompts = ["diamond"]
+        if use_stone_prompts:
+            prompts = STONE_PROMPTS
+            tile_prompts = TILE_PROMPTS
+            logger.info("Using built-in STONE_PROMPTS (%d prompts)", len(prompts))
+        else:
+            prompts = [p.strip() for p in prompt.strip().splitlines() if p.strip()]
+            if not prompts:
+                prompts = ["diamond"]
+            tile_prompts = prompts  # same prompts for tiles when custom
         logger.info("Prompts (%d): %s", len(prompts), prompts)
 
         B, H, W, C = image.shape
@@ -654,7 +686,7 @@ class SAM3Gemstone:
 
                 with torch.inference_mode():
                     unified_mask = self._process_single_image(
-                        image[b_idx], processor, device, prompts, H, W,
+                        image[b_idx], processor, device, prompts, tile_prompts, H, W,
                         score_threshold, nms_iou_threshold, min_solidity,
                         min_area_pct, max_area_pct, max_detections, mask_expansion,
                         enable_sahi, force_sahi, sahi_tile_size, sahi_overlap,
@@ -708,7 +740,7 @@ class SAM3Gemstone:
         return (overlay_batch, mask_batch, cropped_batch, stats_text, total_gems, round(avg_coverage, 2))
 
     def _process_single_image(
-        self, img_tensor_single, processor, device, prompts, H, W,
+        self, img_tensor_single, processor, device, prompts, tile_prompts, H, W,
         score_threshold, nms_iou_threshold, min_solidity,
         min_area_pct, max_area_pct, max_detections, mask_expansion,
         enable_sahi, force_sahi, sahi_tile_size, sahi_overlap,
@@ -740,8 +772,9 @@ class SAM3Gemstone:
         # SAHI tiling
         if need_sahi:
             tiles = self._get_tiles(H, W, sahi_tile_size, sahi_overlap)
-            logger.info("[SAHI] %d tiles (%dx%d, overlap=%.1f)",
-                        len(tiles), sahi_tile_size, sahi_tile_size, sahi_overlap)
+            logger.info("[SAHI] %d tiles (%dx%d, overlap=%.1f), tile_prompts=%d: %s",
+                        len(tiles), sahi_tile_size, sahi_tile_size, sahi_overlap,
+                        len(tile_prompts), tile_prompts)
 
             for t_idx, (tx1, ty1, tx2, ty2) in enumerate(tiles):
                 tile_np = np_img[ty1:ty2, tx1:tx2]
@@ -749,7 +782,7 @@ class SAM3Gemstone:
                 tile_h, tile_w = ty2 - ty1, tx2 - tx1
 
                 tile_state = processor.set_image(tile_pil)
-                t_logits, t_boxes, t_scores = self._run_prompts(processor, tile_state, prompts)
+                t_logits, t_boxes, t_scores = self._run_prompts(processor, tile_state, tile_prompts)
 
                 del tile_state
 

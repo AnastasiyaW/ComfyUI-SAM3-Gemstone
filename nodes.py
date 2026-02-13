@@ -159,6 +159,11 @@ class SAM3Gemstone:
                     "default": 0.50, "min": 0.1, "max": 1.0, "step": 0.05,
                     "tooltip": "NMS IoU overlap threshold — lower = more aggressive dedup",
                 }),
+                "max_detections": ("INT", {
+                    "default": 256, "min": 16, "max": 1024, "step": 16,
+                    "tooltip": "Max gems to segment with ZIM. Lower = faster. "
+                               "512 for dense pavé jewelry, 128 for simple rings.",
+                }),
             },
         }
 
@@ -357,6 +362,9 @@ class SAM3Gemstone:
                     len(boxes), n_tiny, n_small, n_large, mask_threshold)
 
         for idx, box in enumerate(boxes):
+            # Check for user interrupt every iteration
+            mm.throw_exception_if_processing_interrupted()
+
             bx1, by1 = box[0].item(), box[1].item()
             bx2, by2 = box[2].item(), box[3].item()
 
@@ -488,6 +496,7 @@ class SAM3Gemstone:
         all_scores = []
 
         for p_idx, prompt_text in enumerate(prompts):
+            mm.throw_exception_if_processing_interrupted()
             t_p = time.time()
             with torch.inference_mode():
                 result = processor.set_text_prompt(prompt=prompt_text, state=state)
@@ -549,12 +558,12 @@ class SAM3Gemstone:
         mask_threshold: float = 0.5,
         score_threshold: float = 0.10,
         nms_iou_threshold: float = 0.50,
+        max_detections: int = 256,
     ):
         t0 = time.time()
 
         min_area_pct = 0.001
         max_area_pct = 15.0
-        max_detections = 512
         enable_sahi = True
         sahi_overlap = 0.3
         # --- Load / get cached model + processor ---
@@ -703,6 +712,7 @@ class SAM3Gemstone:
                         len(tile_prompts))
 
             for t_idx, (tx1, ty1, tx2, ty2) in enumerate(tiles):
+                mm.throw_exception_if_processing_interrupted()
                 tile_pil = Image.fromarray(np_img[ty1:ty2, tx1:tx2])
                 tile_state = processor.set_image(tile_pil)
                 t_boxes, t_scores = self._run_prompts(processor, tile_state, tile_prompts)
@@ -959,6 +969,7 @@ class ZIMRefineMask:
                 t_refine = time.time()
 
                 for idx, (label_id, x1, y1, x2, y2) in enumerate(all_objects):
+                    mm.throw_exception_if_processing_interrupted()
                     obj_mask_u8 = (labels == label_id).astype(np.uint8)
 
                     # Crop around object with padding — maximizes resolution for ZIM

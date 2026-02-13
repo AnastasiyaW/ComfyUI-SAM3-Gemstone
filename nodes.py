@@ -60,7 +60,7 @@ class SAM3Gemstone:
                     "placeholder": "One prompt per line. 'diamond' works best.",
                 }),
                 "score_threshold": ("FLOAT", {
-                    "default": 0.30, "min": 0.01, "max": 1.0, "step": 0.01,
+                    "default": 0.10, "min": 0.01, "max": 1.0, "step": 0.01,
                     "display": "slider",
                 }),
                 "nms_iou_threshold": ("FLOAT", {
@@ -84,8 +84,12 @@ class SAM3Gemstone:
                     "default": 0, "min": -50, "max": 50, "step": 1,
                 }),
                 "enable_sahi": ("BOOLEAN", {"default": True}),
+                "force_sahi": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Always tile even small images (recommended for small objects like gems)",
+                }),
                 "sahi_tile_size": ("INT", {
-                    "default": 1024, "min": 512, "max": 2048, "step": 128,
+                    "default": 512, "min": 256, "max": 2048, "step": 128,
                 }),
                 "sahi_overlap": ("FLOAT", {
                     "default": 0.3, "min": 0.1, "max": 0.5, "step": 0.05,
@@ -438,6 +442,7 @@ class SAM3Gemstone:
         max_detections: int,
         mask_expansion: int,
         enable_sahi: bool,
+        force_sahi: bool,
         sahi_tile_size: int,
         sahi_overlap: float,
         morph_close_size: int,
@@ -555,8 +560,10 @@ class SAM3Gemstone:
             all_logits, all_boxes, all_scores = self._run_prompts(processor, state, prompts)
             logger.info("[Full-frame] Total detections: %d", len(all_scores))
 
-            # 4. SAHI tiling (optional, for large images)
-            need_sahi = enable_sahi and max(H, W) > sahi_tile_size * 2
+            # 4. SAHI tiling
+            # force_sahi=True: always tile (recommended for small objects like gems)
+            # enable_sahi=True without force: only tile if image is large
+            need_sahi = enable_sahi and (force_sahi or max(H, W) > sahi_tile_size * 2)
             if need_sahi:
                 tiles = self._get_tiles(H, W, sahi_tile_size, sahi_overlap)
                 logger.info("[SAHI] Image %dx%d > threshold, using %d tiles (%dx%d, overlap=%.1f)",

@@ -139,7 +139,10 @@ class SAM3Gemstone:
                     "tooltip": "Subset of prompts for tiles (speed). Default: diamond + gemstone.",
                 }),
                 "sahi_tile_size": ("INT", {
-                    "default": 384, "min": 256, "max": 2048, "step": 128,
+                    "default": 1024, "min": 256, "max": 2048, "step": 128,
+                    "tooltip": "SAM3 internally resizes to 1008×1008. "
+                               "Use 1024 for native resolution per tile (best quality). "
+                               "Smaller tiles = more tiles but same internal resolution.",
                 }),
                 "mask_mode": (["sam3_mask", "bbox_fill", "bbox_tight"], {
                     "default": "sam3_mask",

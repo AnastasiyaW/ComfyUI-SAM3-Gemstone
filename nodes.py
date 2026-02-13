@@ -969,17 +969,36 @@ class ZIMRefineMask:
                     best_idx = int(np.argmax(iou_scores))
                     crop_alpha = masks_out[best_idx].astype(np.float32)
 
+                    if idx < 3:
+                        logger.info("  [ZIM] obj %d: crop=%dx%d, box=[%d,%d,%d,%d], "
+                                    "iou_scores=%s, alpha range=[%.3f, %.3f], alpha_mean=%.3f",
+                                    label_id, crop.shape[1], crop.shape[0],
+                                    int(local_box[0]), int(local_box[1]),
+                                    int(local_box[2]), int(local_box[3]),
+                                    [f"{s:.3f}" for s in iou_scores],
+                                    float(crop_alpha.min()), float(crop_alpha.max()),
+                                    float(crop_alpha.mean()))
+
                     full_zim_alpha = np.zeros((H, W), dtype=np.float32)
                     full_zim_alpha[cy1:cy2, cx1:cx2] = crop_alpha
 
                     # Check if ZIM found something meaningful in this object's area
-                    obj_coverage = (full_zim_alpha * obj_mask_u8).sum() / max(obj_mask_u8.sum(), 1)
+                    obj_mask_sum = max(obj_mask_u8.sum(), 1)
+                    zim_in_obj = (full_zim_alpha * obj_mask_u8).sum()
+                    obj_coverage = zim_in_obj / obj_mask_sum
+
+                    if idx < 3:
+                        logger.info("  [ZIM] obj %d: zim_in_obj=%.1f, obj_mask_sum=%d, "
+                                    "coverage=%.3f (min=%.2f)",
+                                    label_id, float(zim_in_obj), int(obj_mask_sum),
+                                    float(obj_coverage), zim_min_coverage)
 
                     if obj_coverage < zim_min_coverage:
                         zim_fallback += 1
                         unified_alpha = np.maximum(unified_alpha, obj_mask_u8.astype(np.float32))
-                        logger.debug("  [ZIM] obj %d: coverage %.1f%% → FALLBACK",
-                                     label_id, obj_coverage * 100)
+                        if idx < 10:
+                            logger.info("  [ZIM] obj %d: coverage %.3f < %.2f → FALLBACK",
+                                        label_id, float(obj_coverage), zim_min_coverage)
                         continue
 
                     # Use ZIM alpha directly — constrain to dilated object zone

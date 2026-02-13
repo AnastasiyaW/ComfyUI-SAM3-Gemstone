@@ -452,6 +452,12 @@ class SAM3Gemstone:
     ):
         t0 = time.time()
 
+        # --- Free VRAM from other models (Flux, CLIP, VAE, etc.) ---
+        import comfy.model_management as mm
+        logger.info("Requesting VRAM cleanup before SAM3...")
+        mm.soft_empty_cache()
+        logger.info("VRAM cleanup done.")
+
         # --- Load / get cached model ---
         pipe = self._load_model(compile_model)
         model = pipe["model"]
@@ -550,20 +556,26 @@ class SAM3Gemstone:
             np_img = (image[b_idx].cpu().numpy() * 255).astype(np.uint8)
             pil_img = Image.fromarray(np_img)
 
-            # 2. set_image — cache vision features
-            t_si = time.time()
-            state = processor.set_image(pil_img)
-            logger.info("set_image: %.2fs", time.time() - t_si)
-
-            # 3. Multi-prompt on full image
-            logger.info("[Full-frame] Running %d prompts...", len(prompts))
-            all_logits, all_boxes, all_scores = self._run_prompts(processor, state, prompts)
-            logger.info("[Full-frame] Total detections: %d", len(all_scores))
-
-            # 4. SAHI tiling
-            # force_sahi=True: always tile (recommended for small objects like gems)
-            # enable_sahi=True without force: only tile if image is large
+            # 2. Decide: full-frame or tiles-only
             need_sahi = enable_sahi and (force_sahi or max(H, W) > sahi_tile_size * 2)
+
+            all_logits = []
+            all_boxes = []
+            all_scores = []
+
+            if need_sahi and force_sahi:
+                # Skip full-frame pass entirely — saves VRAM (no set_image on full res)
+                logger.info("[SAHI] force_sahi=True, SKIPPING full-frame pass (saves VRAM)")
+            else:
+                # Full-frame pass
+                t_si = time.time()
+                state = processor.set_image(pil_img)
+                logger.info("set_image (full-frame): %.2fs", time.time() - t_si)
+                logger.info("[Full-frame] Running %d prompts...", len(prompts))
+                all_logits, all_boxes, all_scores = self._run_prompts(processor, state, prompts)
+                logger.info("[Full-frame] Total detections: %d", len(all_scores))
+
+            # 3. SAHI tiling
             if need_sahi:
                 tiles = self._get_tiles(H, W, sahi_tile_size, sahi_overlap)
                 logger.info("[SAHI] Image %dx%d > threshold, using %d tiles (%dx%d, overlap=%.1f)",

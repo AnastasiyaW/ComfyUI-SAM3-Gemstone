@@ -40,7 +40,6 @@ ZIM_CKPT_SUBDIR = "zim_vit_b_2043"
 _sam3_cache: dict = {}
 _zim_cache: dict = {}
 
-ZIM_LARGE_OBJECT_PCT = 5.0
 
 # ---------------------------------------------------------------------------
 # Multi-prompt stone detection — ported from jewelry_segmenter.py
@@ -251,9 +250,8 @@ class SAM3Gemstone:
         # Build processor + monkey-patch (processor references model, works on whatever device model is on)
         from sam3.model.sam3_image_processor import Sam3Processor
         from sam3.model.box_ops import box_cxcywh_to_xyxy
-        from torch.nn.functional import interpolate as F_interpolate
 
-        processor = Sam3Processor(model, confidence_threshold=0.01)
+        processor = Sam3Processor(model, confidence_threshold=0.15)
 
         @torch.inference_mode()
         def _forward_grounding_no_presence(self_proc, state):
@@ -265,7 +263,6 @@ class SAM3Gemstone:
             )
             out_bbox = outputs["pred_boxes"]
             out_logits = outputs["pred_logits"]
-            out_masks = outputs["pred_masks"]
 
             # Raw sigmoid scores WITHOUT presence_logit_dec multiplier
             out_probs = out_logits.sigmoid().squeeze(-1)
@@ -275,7 +272,6 @@ class SAM3Gemstone:
 
             keep = out_probs > self_proc.confidence_threshold
             out_probs = out_probs[keep]
-            out_masks = out_masks[keep]
             out_bbox = out_bbox[keep]
 
             boxes = box_cxcywh_to_xyxy(out_bbox)
@@ -284,13 +280,8 @@ class SAM3Gemstone:
             scale_fct = torch.tensor([img_w, img_h, img_w, img_h], device=self_proc.device)
             boxes = boxes * scale_fct[None, :]
 
-            out_masks = F_interpolate(
-                out_masks.unsqueeze(1), (img_h, img_w),
-                mode="bilinear", align_corners=False,
-            ).sigmoid()
-
-            state["masks_logits"] = out_masks
-            state["masks"] = out_masks > 0.5
+            # SAM3 = detector only: we only need boxes + scores.
+            # Skip expensive mask interpolation — ZIM handles segmentation.
             state["boxes"] = boxes
             state["scores"] = out_probs
             return state
@@ -305,148 +296,108 @@ class SAM3Gemstone:
         return pipe
 
     # =====================================================================
-    #  ZIM refinement — refine edges of surviving detections
-    #  Strategy: Use ZIM alpha DIRECTLY per detection bbox.
-    #  ZIM produces pixel-perfect sigmoid [0,1] alpha natively.
-    #  We feed box + point prompts derived from SAM3 mask (centroid as
-    #  foreground, corners outside mask as background) for best results.
-    #  Constrain to dilated SAM3 zone to prevent bleeding into neighbors.
+    #  ZIM segmentation — smooth alpha edges via guided filter + Gaussian
     # =====================================================================
     @staticmethod
-    def _sam3_mask_to_points(sam3_np, box, H, W, n_bg=4):
-        """Extract point prompts from SAM3 binary mask for ZIM.
+    def _smooth_alpha(alpha_np, crop_rgb, guide_radius=8, guide_eps=0.01,
+                      blur_ksize=5, blur_sigma=0.8):
+        """Smooth ZIM alpha edges using guided filter + edge-band Gaussian.
 
-        Returns (point_coords Nx2, point_labels N) or (None, None) if mask empty.
-        - 1 foreground point: centroid of the mask
-        - n_bg background points: midpoints of box edges outside the mask
+        1. Guided filter: smooths alpha respecting RGB edges (like Adobe Refine Edge)
+        2. Edge-band Gaussian: anti-aliases only the boundary pixels
+        3. Interior stays solid (1.0), exterior stays transparent (0.0)
+
+        All operations in float32 to preserve sigmoid precision.
         """
-        ys, xs = np.where(sam3_np > 0)
-        if len(ys) == 0:
-            return None, None
+        # Step 1: Guided filter — edge-aware smoothing using RGB as guide
+        # Work in float32 throughout to preserve ZIM's sigmoid precision
+        guide_gray = cv2.cvtColor(crop_rgb, cv2.COLOR_RGB2GRAY).astype(np.float32) / 255.0
+        refined = cv2.ximgproc.guidedFilter(
+            guide=guide_gray, src=alpha_np.astype(np.float32),
+            radius=guide_radius, eps=guide_eps,
+        )
 
-        # Foreground: centroid of the mask pixels
-        cx = float(xs.mean())
-        cy = float(ys.mean())
+        # Step 2: Build edge band mask (boundary zone between fg and bg)
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        binary = (refined > 0.5).astype(np.uint8) * 255
+        inner = cv2.erode(binary, kernel, iterations=1)
+        outer = cv2.dilate(binary, kernel, iterations=1)
+        edge_band = ((outer > 0) & (inner == 0)).astype(np.float32)
 
-        bx1, by1, bx2, by2 = box[0].item(), box[1].item(), box[2].item(), box[3].item()
-        bw = bx2 - bx1
-        bh = by2 - by1
+        # Step 3: Gaussian blur for anti-aliasing in edge band only
+        blurred = cv2.GaussianBlur(refined, (blur_ksize, blur_ksize), blur_sigma)
 
-        # Background: 4 points just outside each box edge (clamped to image)
-        margin = 3  # pixels outside the box
-        bg_candidates = [
-            (max(0, bx1 - margin), (by1 + by2) / 2),     # left of box
-            (min(W - 1, bx2 + margin), (by1 + by2) / 2),  # right of box
-            ((bx1 + bx2) / 2, max(0, by1 - margin)),      # above box
-            ((bx1 + bx2) / 2, min(H - 1, by2 + margin)),  # below box
-        ]
+        # Step 4: Blend — smooth edges in band, keep crisp interior/exterior
+        result = refined * (1 - edge_band) + blurred * edge_band
 
-        coords = [[cx, cy]]
-        labels = [1]  # foreground
-        for bx, by in bg_candidates[:n_bg]:
-            coords.append([bx, by])
-            labels.append(0)  # background
+        return np.clip(result, 0, 1).astype(np.float32)
 
-        return np.array(coords, dtype=np.float32), np.array(labels, dtype=np.int32)
+    def _segment_with_zim(self, zim_predictor, np_img, boxes, H, W):
+        """Segment each detection with ZIM alpha matting (no SAM3 masks needed).
 
-    def _refine_with_zim(self, zim_predictor, np_img, surviving, all_boxes, all_logits, H, W):
-        """Refine each surviving detection with ZIM alpha matting.
-
-        ALWAYS crops around each object's bbox+padding before calling ZIM.
-        ZIM internally resizes to 1024x1024 — on a 4000px image a 10px
-        gemstone would become ~2.5px (invisible). Cropping ensures every
-        object fills enough of ZIM's input for pixel-perfect edges.
-        SAM3 mask provides point prompts: centroid=foreground, box corners=background.
+        SAM3 is used as detector only — provides boxes. ZIM crops around each
+        box with padding and produces sigmoid alpha [0,1] masks.
+        Point prompt: bbox center = foreground, 4 edge midpoints outside = background.
+        Post-processing: guided filter + edge-band Gaussian for smooth edges.
         """
         t0 = time.time()
-        refined_logits = {}
+        PAD = 30
+        unified_mask = torch.zeros(H, W, dtype=torch.float32)
 
-        BAND_OUTER = 10
-        ZIM_MIN_COVERAGE = 0.10
-        PAD = 30  # crop padding around bbox
+        logger.info("[ZIM] Segmenting %d objects (crop per box, smooth edges)", len(boxes))
 
-        logger.info("[ZIM] Refining %d objects (all via crop for max resolution)", len(surviving))
-
-        for idx, gi in enumerate(surviving):
-            box = all_boxes[gi]
+        for idx, box in enumerate(boxes):
+            bx1, by1 = box[0].item(), box[1].item()
+            bx2, by2 = box[2].item(), box[3].item()
 
             # Crop around detection bbox with padding
-            x1 = max(0, int(box[0].item()) - PAD)
-            y1 = max(0, int(box[1].item()) - PAD)
-            x2 = min(W, int(box[2].item()) + PAD)
-            y2 = min(H, int(box[3].item()) + PAD)
+            x1 = max(0, int(bx1) - PAD)
+            y1 = max(0, int(by1) - PAD)
+            x2 = min(W, int(bx2) + PAD)
+            y2 = min(H, int(by2) + PAD)
 
             crop = np_img[y1:y2, x1:x2].copy()
             zim_predictor.set_image(crop)
 
-            local_box = np.array([
-                box[0].item() - x1, box[1].item() - y1,
-                box[2].item() - x1, box[3].item() - y1,
-            ], dtype=np.float32)
+            local_box = np.array([bx1 - x1, by1 - y1, bx2 - x1, by2 - y1], dtype=np.float32)
 
-            # Get SAM3 mask for this detection
-            sam3_mask = all_logits[gi]
-            if isinstance(sam3_mask, torch.Tensor):
-                sam3_np = (sam3_mask.numpy() > 0.5).astype(np.uint8)
-            else:
-                sam3_np = (sam3_mask > 0.5).astype(np.uint8) if isinstance(sam3_mask, np.ndarray) else np.zeros((H, W), dtype=np.uint8)
-
-            # Build point prompts from SAM3 mask in crop-local coordinates
-            local_sam3 = sam3_np[y1:y2, x1:x2]
+            # Point prompts: center of box = foreground, 4 outside points = background
+            cx = (local_box[0] + local_box[2]) / 2
+            cy = (local_box[1] + local_box[3]) / 2
             crop_h, crop_w = y2 - y1, x2 - x1
-            local_box_for_pts = torch.tensor([
-                box[0].item() - x1, box[1].item() - y1,
-                box[2].item() - x1, box[3].item() - y1,
-            ])
-            pt_coords, pt_labels = self._sam3_mask_to_points(
-                local_sam3, local_box_for_pts, crop_h, crop_w)
+            margin = 3
+            pt_coords = np.array([
+                [cx, cy],  # foreground: box center
+                [max(0, local_box[0] - margin), cy],                    # bg: left
+                [min(crop_w - 1, local_box[2] + margin), cy],           # bg: right
+                [cx, max(0, local_box[1] - margin)],                    # bg: top
+                [cx, min(crop_h - 1, local_box[3] + margin)],           # bg: bottom
+            ], dtype=np.float32)
+            pt_labels = np.array([1, 0, 0, 0, 0], dtype=np.int32)
 
-            if pt_coords is not None:
-                masks, scores, _ = zim_predictor.predict(
-                    point_coords=pt_coords, point_labels=pt_labels,
-                    box=local_box, multimask_output=False,
-                )
-            else:
-                masks, scores, _ = zim_predictor.predict(box=local_box, multimask_output=False)
+            masks, scores, _ = zim_predictor.predict(
+                point_coords=pt_coords, point_labels=pt_labels,
+                box=local_box, multimask_output=False,
+            )
 
-            # Map crop alpha back to full image
-            full_zim = np.zeros((H, W), dtype=np.float32)
-            full_zim[y1:y2, x1:x2] = masks[0].astype(np.float32)
+            # Smooth alpha edges — guided filter + edge-band Gaussian AA
+            raw_alpha = masks[0].astype(np.float32)
+            smooth_alpha = self._smooth_alpha(raw_alpha, crop)
 
-            obj_coverage = (full_zim * sam3_np).sum() / max(sam3_np.sum(), 1)
-            if obj_coverage < ZIM_MIN_COVERAGE:
-                logger.debug("  [ZIM] det %d: coverage %.1f%% → FALLBACK to SAM3", gi, obj_coverage * 100)
-                continue
-
-            # Use ZIM alpha directly — constrain to dilated SAM3 zone
-            kern = cv2.getStructuringElement(
-                cv2.MORPH_ELLIPSE, (BAND_OUTER * 2 + 1, BAND_OUTER * 2 + 1))
-            obj_zone = cv2.dilate(sam3_np, kern, iterations=1).astype(np.float32)
-            refined_logits[gi] = torch.from_numpy((full_zim * obj_zone).clip(0, 1))
+            # Map crop alpha back to full image, max-union merge
+            crop_alpha = torch.from_numpy(smooth_alpha)
+            unified_mask[y1:y2, x1:x2] = torch.max(
+                unified_mask[y1:y2, x1:x2], crop_alpha)
 
             if (idx + 1) % 50 == 0:
-                logger.info("[ZIM] %d/%d done", idx + 1, len(surviving))
+                logger.info("[ZIM] %d/%d done", idx + 1, len(boxes))
 
-        logger.info("[ZIM] Total refinement: %.2fs for %d objects (refined %d)",
-                    time.time() - t0, len(surviving), len(refined_logits))
-        return refined_logits
+        logger.info("[ZIM] Segmented %d objects in %.2fs", len(boxes), time.time() - t0)
+        return unified_mask.clamp(0, 1)
 
     # =====================================================================
     #  Helpers
     # =====================================================================
-    @staticmethod
-    def _expand_mask(mask: torch.Tensor, pixels: int) -> torch.Tensor:
-        if pixels == 0:
-            return mask
-        kernel_size = abs(pixels) * 2 + 1
-        pad = abs(pixels)
-        m = mask.unsqueeze(0).unsqueeze(0).float()
-        if pixels > 0:
-            m = torch.nn.functional.max_pool2d(m, kernel_size=kernel_size, stride=1, padding=pad)
-        else:
-            m = -torch.nn.functional.max_pool2d(-m, kernel_size=kernel_size, stride=1, padding=pad)
-        return m.squeeze(0).squeeze(0).clamp(0, 1)
-
     @staticmethod
     def _get_tiles(H: int, W: int, tile_size: int, overlap: float) -> list:
         step = int(tile_size * (1 - overlap))
@@ -464,32 +415,13 @@ class SAM3Gemstone:
                     tiles.append(key)
         return tiles
 
-    @staticmethod
-    def _check_solidity(mask_np: np.ndarray, min_solidity: float) -> bool:
-        contours, _ = cv2.findContours(
-            mask_np.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-        )
-        if not contours:
-            return False
-        cnt = max(contours, key=cv2.contourArea)
-        hull = cv2.convexHull(cnt)
-        hull_area = cv2.contourArea(hull)
-        if hull_area == 0:
-            return False
-        return cv2.contourArea(cnt) / hull_area >= min_solidity
+    def _run_prompts(self, processor, state, prompts, max_per_prompt=50):
+        """Run multiple prompts on cached image state.
 
-    @staticmethod
-    def _morph_close(mask_t: torch.Tensor, kernel_size: int) -> torch.Tensor:
-        if kernel_size <= 0:
-            return mask_t
-        mask_np = (mask_t.cpu().numpy() * 255).astype(np.uint8)
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
-        closed = cv2.morphologyEx(mask_np, cv2.MORPH_CLOSE, kernel, iterations=1)
-        return torch.from_numpy(closed.astype(np.float32) / 255.0)
-
-    def _run_prompts(self, processor, state, prompts):
-        """Run multiple prompts on cached image state. Returns (logits, boxes, scores) lists."""
-        all_logits = []
+        Returns (boxes, scores) lists — NO masks stored.
+        SAM3 is used as a detector only (bbox + score).
+        ZIM handles segmentation later via bbox crops.
+        """
         all_boxes = []
         all_scores = []
 
@@ -498,34 +430,41 @@ class SAM3Gemstone:
             with torch.inference_mode():
                 result = processor.set_text_prompt(prompt=prompt_text, state=state)
 
-            masks_logits = result["masks_logits"]
             boxes = result["boxes"]
             scores = result["scores"]
 
             n = scores.shape[0] if scores.ndim > 0 else (1 if scores.numel() > 0 else 0)
-            logger.info("  Prompt %d/%d '%s': %d detections (%.2fs)",
-                        p_idx + 1, len(prompts), prompt_text, n, time.time() - t_p)
 
             if n > 0:
-                logits_cpu = masks_logits.squeeze(1).cpu()
                 boxes_cpu = boxes.cpu()
                 scores_cpu = scores.cpu()
-                if logits_cpu.ndim == 2:
-                    logits_cpu = logits_cpu.unsqueeze(0)
                 if boxes_cpu.ndim == 1:
                     boxes_cpu = boxes_cpu.unsqueeze(0)
                 if scores_cpu.ndim == 0:
                     scores_cpu = scores_cpu.unsqueeze(0)
 
-                for i in range(n):
-                    all_logits.append(logits_cpu[i])
+                # Keep only top-K by score
+                if n > max_per_prompt:
+                    topk_scores, topk_idx = scores_cpu.topk(max_per_prompt)
+                    boxes_cpu = boxes_cpu[topk_idx]
+                    scores_cpu = topk_scores
+                    kept = max_per_prompt
+                else:
+                    kept = n
+
+                for i in range(kept):
                     all_boxes.append(boxes_cpu[i])
                     all_scores.append(scores_cpu[i])
-                    logger.debug("    det %d: score=%.3f", i, scores_cpu[i].item())
+
+                logger.info("  Prompt %d/%d '%s': %d raw → %d kept (%.2fs)",
+                            p_idx + 1, len(prompts), prompt_text, n, kept, time.time() - t_p)
+            else:
+                logger.info("  Prompt %d/%d '%s': 0 detections (%.2fs)",
+                            p_idx + 1, len(prompts), prompt_text, time.time() - t_p)
 
             processor.reset_all_prompts(state)
 
-        return all_logits, all_boxes, all_scores
+        return all_boxes, all_scores
 
     def _compute_stats(self, mask: torch.Tensor, H: int, W: int) -> tuple:
         binary = (mask > 0.5).cpu().numpy().astype(np.uint8)
@@ -551,14 +490,11 @@ class SAM3Gemstone:
         # Hardcoded sensible defaults
         score_threshold = 0.10
         nms_iou_threshold = 0.50
-        min_solidity = 0.30
         min_area_pct = 0.001
         max_area_pct = 15.0
-        max_detections = 128
-        mask_expansion = 0
+        max_detections = 512
         enable_sahi = True
         sahi_overlap = 0.3
-        morph_close_size = 3
         compile_model = False
 
         # --- Load / get cached model + processor ---
@@ -616,10 +552,10 @@ class SAM3Gemstone:
                 with torch.inference_mode():
                     unified_mask = self._process_single_image(
                         image[b_idx], processor, device, prompts, tile_prompts, H, W,
-                        score_threshold, nms_iou_threshold, min_solidity,
-                        min_area_pct, max_area_pct, max_detections, mask_expansion,
+                        score_threshold, nms_iou_threshold,
+                        min_area_pct, max_area_pct, max_detections,
                         enable_sahi, sahi_tile_size, sahi_overlap,
-                        morph_close_size, zim_predictor,
+                        zim_predictor,
                     )
 
                 # Stats
@@ -670,72 +606,62 @@ class SAM3Gemstone:
 
     def _process_single_image(
         self, img_tensor_single, processor, device, prompts, tile_prompts, H, W,
-        score_threshold, nms_iou_threshold, min_solidity,
-        min_area_pct, max_area_pct, max_detections, mask_expansion,
+        score_threshold, nms_iou_threshold,
+        min_area_pct, max_area_pct, max_detections,
         enable_sahi, sahi_tile_size, sahi_overlap,
-        morph_close_size, zim_predictor,
+        zim_predictor,
     ):
-        """Process one image from batch. Returns unified_mask (H, W) float tensor."""
+        """Process one image. SAM3 = detector (boxes only), ZIM = segmentor (alpha).
 
+        Pipeline: SAM3 prompts → boxes + scores → NMS → area filter →
+                  ZIM crop per box → alpha masks → max-union merge.
+        No SAM3 masks stored — massive RAM savings.
+        """
         np_img = (img_tensor_single.cpu().numpy() * 255).astype(np.uint8)
 
-        all_logits = []
         all_boxes = []
         all_scores = []
 
-        # Full-frame pass — ALWAYS run all prompts on full image
+        # Full-frame pass — all prompts on full image
         pil_img = Image.fromarray(np_img)
         t_si = time.time()
         state = processor.set_image(pil_img)
         logger.info("set_image (full-frame): %.2fs", time.time() - t_si)
         logger.info("[Full-frame] Running %d prompts...", len(prompts))
-        all_logits, all_boxes, all_scores = self._run_prompts(processor, state, prompts)
-        logger.info("[Full-frame] Total detections: %d", len(all_scores))
+        ff_boxes, ff_scores = self._run_prompts(processor, state, prompts)
+        all_boxes.extend(ff_boxes)
+        all_scores.extend(ff_scores)
+        logger.info("[Full-frame] Total detections: %d", len(ff_scores))
         del state
 
         # SAHI tiling
         if enable_sahi:
             tiles = self._get_tiles(H, W, sahi_tile_size, sahi_overlap)
-            logger.info("[SAHI] %d tiles (%dx%d, overlap=%.1f), tile_prompts=%d: %s",
+            logger.info("[SAHI] %d tiles (%dx%d, overlap=%.1f), tile_prompts=%d",
                         len(tiles), sahi_tile_size, sahi_tile_size, sahi_overlap,
-                        len(tile_prompts), tile_prompts)
+                        len(tile_prompts))
 
             for t_idx, (tx1, ty1, tx2, ty2) in enumerate(tiles):
-                tile_np = np_img[ty1:ty2, tx1:tx2]
-                tile_pil = Image.fromarray(tile_np)
-                tile_h, tile_w = ty2 - ty1, tx2 - tx1
-
+                tile_pil = Image.fromarray(np_img[ty1:ty2, tx1:tx2])
                 tile_state = processor.set_image(tile_pil)
-                t_logits, t_boxes, t_scores = self._run_prompts(processor, tile_state, tile_prompts)
-
+                t_boxes, t_scores = self._run_prompts(processor, tile_state, tile_prompts)
                 del tile_state
 
+                # Remap tile boxes to full image coordinates
                 for i in range(len(t_scores)):
                     box = t_boxes[i].clone()
-                    box[0] += tx1
-                    box[1] += ty1
-                    box[2] += tx1
-                    box[3] += ty1
+                    box[0] += tx1; box[1] += ty1; box[2] += tx1; box[3] += ty1
                     all_boxes.append(box)
                     all_scores.append(t_scores[i])
 
-                    tile_logit = t_logits[i]
-                    if tile_logit.shape[0] != tile_h or tile_logit.shape[1] != tile_w:
-                        tile_logit = torch.nn.functional.interpolate(
-                            tile_logit.unsqueeze(0).unsqueeze(0),
-                            size=(tile_h, tile_w), mode="bilinear", align_corners=False,
-                        ).squeeze(0).squeeze(0)
-                    all_logits.append((tile_logit, tx1, ty1, tx2, ty2))
-
-                if (t_idx + 1) % 5 == 0:
+                if (t_idx + 1) % 10 == 0:
                     logger.info("[SAHI] Tile %d/%d done", t_idx + 1, len(tiles))
 
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
-
             logger.info("[SAHI] Total detections after tiling: %d", len(all_scores))
 
-        # NMS deduplication
+        # --- NMS deduplication (boxes only — fast) ---
         if len(all_scores) == 0:
             logger.warning("No detections at all!")
             return torch.zeros(H, W, dtype=torch.float32)
@@ -756,94 +682,60 @@ class SAM3Gemstone:
         scores_filtered = scores_t[indices_above]
 
         keep_nms = nms(boxes_filtered.to(device), scores_filtered.to(device), nms_iou_threshold)
-        kept_global = indices_above[keep_nms.cpu()].cpu()
+        kept_indices = indices_above[keep_nms.cpu()]
         logger.info("[NMS] iou=%.2f: %d -> %d detections",
                     nms_iou_threshold, len(indices_above), len(keep_nms))
 
-        # Quality filtering
+        # --- Area filter by bbox (no masks needed) ---
         image_area = H * W
-        surviving = []
-        for gi in kept_global:
-            gi = gi.item()
-            logit = self._expand_logit(all_logits[gi], H, W)
-            binary_np = (logit.numpy() > 0.5).astype(np.uint8)
-            mask_area = binary_np.sum()
-            area_pct = mask_area / image_area * 100
-            score_val = all_scores[gi].item()
-
-            if area_pct < min_area_pct:
-                logger.debug("    [SKIP] det %d: area %.4f%% < min", gi, area_pct)
+        surviving_boxes = []
+        surviving_scores = []
+        for idx in kept_indices:
+            idx = idx.item()
+            box = all_boxes[idx]
+            bw = (box[2] - box[0]).item()
+            bh = (box[3] - box[1]).item()
+            box_area_pct = (bw * bh) / image_area * 100
+            if box_area_pct < min_area_pct:
                 continue
-            if area_pct > max_area_pct:
-                logger.debug("    [SKIP] det %d: area %.1f%% > max", gi, area_pct)
+            if box_area_pct > max_area_pct:
                 continue
-            if min_solidity > 0 and not self._check_solidity(binary_np, min_solidity):
-                logger.debug("    [SKIP] det %d: solidity below %.2f", gi, min_solidity)
-                continue
+            surviving_boxes.append(box)
+            surviving_scores.append(all_scores[idx].item())
 
-            surviving.append(gi)
-            logger.debug("    [KEEP] det %d: score=%.3f area=%.3f%%", gi, score_val, area_pct)
-
-        logger.info("[Quality] %d -> %d detections after area+solidity",
-                    len(keep_nms), len(surviving))
+        logger.info("[Area filter] %d -> %d detections", len(keep_nms), len(surviving_boxes))
 
         # Top-K
-        if len(surviving) > max_detections:
-            surv_scores = torch.tensor([all_scores[i].item() for i in surviving])
-            _, topk_idx = surv_scores.topk(max_detections)
-            surviving = [surviving[i] for i in topk_idx]
+        if len(surviving_boxes) > max_detections:
+            score_order = sorted(range(len(surviving_scores)),
+                                 key=lambda i: surviving_scores[i], reverse=True)
+            surviving_boxes = [surviving_boxes[i] for i in score_order[:max_detections]]
+            surviving_scores = [surviving_scores[i] for i in score_order[:max_detections]]
             logger.info("[Top-K] Clamped to %d detections", max_detections)
 
-        # ZIM refinement
-        if zim_predictor is not None and len(surviving) > 0:
-            try:
-                for gi in surviving:
-                    all_logits[gi] = self._expand_logit(all_logits[gi], H, W)
-                refined = self._refine_with_zim(
-                    zim_predictor, np_img, surviving, all_boxes, all_logits, H, W
-                )
-                for gi, refined_logit in refined.items():
-                    all_logits[gi] = refined_logit
-                logger.info("[ZIM] Replaced %d/%d logits", len(refined), len(surviving))
-            except Exception as e:
-                logger.error("[ZIM] Refinement failed: %s — using SAM3 masks", e)
-
-        # Soft max-union merge
-        if len(surviving) == 0:
+        if len(surviving_boxes) == 0:
             logger.warning("No detections survived filtering!")
             return torch.zeros(H, W, dtype=torch.float32)
 
-        unified_logits = torch.zeros(H, W, dtype=torch.float32)
-        for gi in surviving:
-            logit = self._expand_logit(all_logits[gi], H, W)
-            unified_logits = torch.max(unified_logits, logit)
+        logger.info("[Surviving] %d detections → ZIM segmentation", len(surviving_boxes))
 
+        # --- ZIM segmentation: bbox crops → alpha masks ---
         if zim_predictor is not None:
-            unified_mask = unified_logits.clamp(0, 1)
+            unified_mask = self._segment_with_zim(
+                zim_predictor, np_img, surviving_boxes, H, W)
         else:
-            unified_mask = (unified_logits > 0.5).float()
+            # Fallback: no ZIM — create binary box masks
+            unified_mask = torch.zeros(H, W, dtype=torch.float32)
+            for box in surviving_boxes:
+                x1, y1 = int(box[0].item()), int(box[1].item())
+                x2, y2 = int(box[2].item()), int(box[3].item())
+                unified_mask[y1:y2, x1:x2] = 1.0
+
         coverage = unified_mask.mean().item() * 100
-        logger.info("[Merge] %d masks merged, coverage: %.1f%%", len(surviving), coverage)
-
-        # Mask expansion
-        if mask_expansion != 0 and unified_mask.sum() > 0:
-            unified_mask = self._expand_mask(unified_mask, mask_expansion)
-
-        # Morphological closing — only for binary SAM3 masks (ZIM alpha is already smooth)
-        if zim_predictor is None and morph_close_size > 0 and unified_mask.sum() > 0:
-            unified_mask = self._morph_close(unified_mask, morph_close_size)
+        logger.info("[Done] %d objects, coverage: %.1f%%", len(surviving_boxes), coverage)
 
         return unified_mask
 
-    @staticmethod
-    def _expand_logit(logit_or_tuple, H, W):
-        """Expand compact tile logit to full image size, or return as-is if already full."""
-        if isinstance(logit_or_tuple, tuple):
-            tile_logit, tx1, ty1, tx2, ty2 = logit_or_tuple
-            full = torch.zeros(H, W, dtype=torch.float32)
-            full[ty1:ty2, tx1:tx2] = tile_logit
-            return full
-        return logit_or_tuple
 
 
 # ============================================================================
@@ -1010,7 +902,9 @@ class ZIMRefineMask:
                     else:
                         masks_out, scores, _ = predictor.predict(box=local_box, multimask_output=False)
 
-                    crop_alpha = masks_out[0].astype(np.float32)
+                    # Smooth alpha edges — guided filter + edge-band Gaussian AA
+                    raw_alpha = masks_out[0].astype(np.float32)
+                    crop_alpha = SAM3Gemstone._smooth_alpha(raw_alpha, crop)
 
                     full_zim_alpha = np.zeros((H, W), dtype=np.float32)
                     full_zim_alpha[cy1:cy2, cx1:cx2] = crop_alpha

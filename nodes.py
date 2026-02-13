@@ -141,9 +141,15 @@ class SAM3Gemstone:
                 "sahi_tile_size": ("INT", {
                     "default": 384, "min": 256, "max": 2048, "step": 128,
                 }),
+                "mask_mode": (["sam3_mask", "bbox_fill", "bbox_tight"], {
+                    "default": "sam3_mask",
+                    "tooltip": "sam3_mask = SAM3 predicted masks (best quality), "
+                               "bbox_fill = filled bounding boxes (fast fallback), "
+                               "bbox_tight = 80% inner bbox (tighter than full bbox)",
+                }),
                 "mask_threshold": ("FLOAT", {
                     "default": 0.5, "min": 0.0, "max": 1.0, "step": 0.05,
-                    "tooltip": "Alpha threshold: 0.0 = soft sigmoid, "
+                    "tooltip": "Alpha threshold for sam3_mask mode: 0.0 = soft sigmoid, "
                                "0.5 = crisp binary (best for small gems)",
                 }),
                 "score_threshold": ("FLOAT", {
@@ -420,6 +426,7 @@ class SAM3Gemstone:
         full_image_prompts: str,
         tile_prompts: str,
         sahi_tile_size: int,
+        mask_mode: str = "sam3_mask",
         mask_threshold: float = 0.5,
         score_threshold: float = 0.10,
         nms_iou_threshold: float = 0.50,
@@ -482,7 +489,7 @@ class SAM3Gemstone:
                         score_threshold, nms_iou_threshold,
                         min_area_pct, max_area_pct, max_detections,
                         enable_sahi, sahi_tile_size, sahi_overlap,
-                        mask_threshold,
+                        mask_threshold, mask_mode,
                     )
 
                 # Stats
@@ -537,12 +544,15 @@ class SAM3Gemstone:
         score_threshold: float, nms_iou_threshold: float,
         min_area_pct: float, max_area_pct: float, max_detections: int,
         enable_sahi: bool, sahi_tile_size: int, sahi_overlap: float,
-        mask_threshold: float = 0.5,
+        mask_threshold: float = 0.5, mask_mode: str = "sam3_mask",
     ) -> torch.Tensor:
         """Process one image using SAM3's own masks.
 
         Pipeline: SAM3 prompts (full-frame + SAHI tiles) → boxes + scores + low-res masks
                   → NMS → area filter → upscale surviving masks → merge.
+        mask_mode: 'sam3_mask' = use SAM3 predicted masks cropped to bbox
+                   'bbox_fill' = fill entire bbox (fast, coarse)
+                   'bbox_tight' = fill 80% inner bbox (tighter)
         """
         np_img = (img_tensor_single.cpu().numpy() * 255).astype(np.uint8)
 
@@ -646,17 +656,46 @@ class SAM3Gemstone:
             logger.warning("No detections survived filtering!")
             return torch.zeros(H, W, dtype=torch.float32)
 
-        logger.info("[Surviving] %d detections → mask merge", len(surviving_indices))
+        logger.info("[Surviving] %d detections → mask merge (mode=%s)", len(surviving_indices), mask_mode)
 
-        # --- Upscale surviving masks, crop to bbox, and merge ---
+        # --- Merge masks based on mode ---
         unified_mask = torch.zeros(H, W, dtype=torch.float32)
-        has_masks = len(all_masks) == len(all_boxes)
+        has_masks = len(all_masks) == len(all_boxes) and mask_mode == "sam3_mask"
 
-        if has_masks:
-            t_merge = time.time()
+        t_merge = time.time()
+
+        if mask_mode in ("bbox_fill", "bbox_tight"):
+            # Simple bbox-based masks — fast, no SAM3 mask upscaling needed
+            shrink = 0.0 if mask_mode == "bbox_fill" else 0.1  # 10% shrink for tight
+            for idx_val in surviving_indices:
+                box = all_boxes[idx_val]
+                bx1, by1 = int(box[0].item()), int(box[1].item())
+                bx2, by2 = int(box[2].item()), int(box[3].item())
+                if shrink > 0:
+                    bw, bh = bx2 - bx1, by2 - by1
+                    sx, sy = int(bw * shrink), int(bh * shrink)
+                    bx1, by1 = bx1 + sx, by1 + sy
+                    bx2, by2 = bx2 - sx, by2 - sy
+                bx1 = max(0, bx1); by1 = max(0, by1)
+                bx2 = min(W, bx2); by2 = min(H, by2)
+                if bx2 > bx1 and by2 > by1:
+                    unified_mask[by1:by2, bx1:bx2] = 1.0
+            logger.info("[Merge] %d boxes filled (mode=%s) in %.2fs",
+                        len(surviving_indices), mask_mode, time.time() - t_merge)
+
+        elif has_masks:
+            # SAM3 predicted masks — upscale, crop to bbox, merge
+            _logged_shape = False
+            n_flooded = 0  # masks that cover >90% of bbox (likely garbage)
             for idx_val in surviving_indices:
                 mask_lr, tx1, ty1, tx2, ty2 = all_masks[idx_val]
                 tile_h, tile_w = ty2 - ty1, tx2 - tx1
+
+                if not _logged_shape:
+                    logger.info("[Merge] mask_lowres shape: %s, tile: %dx%d",
+                                list(mask_lr.shape), tile_w, tile_h)
+                    _logged_shape = True
+
                 # Upscale low-res mask to tile/full-frame size
                 mask_up = torch.nn.functional.interpolate(
                     mask_lr.unsqueeze(0).unsqueeze(0).float(),
@@ -667,14 +706,15 @@ class SAM3Gemstone:
                 if mask_threshold > 0.0:
                     mask_up = (mask_up > mask_threshold).float()
 
-                # CRITICAL: crop mask to detection bbox + padding.
+                # Crop mask to detection bbox + MINIMAL padding.
                 # SAM3 mask covers the entire tile/image — we only want the
                 # region around this specific detection's bounding box.
                 box = all_boxes[idx_val]
                 bx1, by1 = int(box[0].item()), int(box[1].item())
                 bx2, by2 = int(box[2].item()), int(box[3].item())
-                bbox_size = max(bx2 - bx1, by2 - by1)
-                pad = max(5, int(bbox_size * 0.15))
+                bbox_w, bbox_h = bx2 - bx1, by2 - by1
+                # Minimal padding: 3px or 5% of bbox size
+                pad = max(3, int(max(bbox_w, bbox_h) * 0.05))
 
                 # Clamp to image bounds
                 rx1 = max(0, bx1 - pad)
@@ -683,24 +723,35 @@ class SAM3Gemstone:
                 ry2 = min(H, by2 + pad)
 
                 # Convert to tile-local coords for indexing mask_up
-                lx1 = rx1 - tx1
-                ly1 = ry1 - ty1
-                lx2 = rx2 - tx1
-                ly2 = ry2 - ty1
-
-                # Bounds check (mask_up is tile-sized, not full image)
-                lx1 = max(0, min(lx1, tile_w))
-                ly1 = max(0, min(ly1, tile_h))
-                lx2 = max(0, min(lx2, tile_w))
-                ly2 = max(0, min(ly2, tile_h))
+                lx1 = max(0, min(rx1 - tx1, tile_w))
+                ly1 = max(0, min(ry1 - ty1, tile_h))
+                lx2 = max(0, min(rx2 - tx1, tile_w))
+                ly2 = max(0, min(ry2 - ty1, tile_h))
 
                 if lx2 > lx1 and ly2 > ly1:
                     cropped = mask_up[ly1:ly2, lx1:lx2]
-                    unified_mask[ry1:ry2, rx1:rx2] = torch.max(
-                        unified_mask[ry1:ry2, rx1:rx2], cropped)
 
-            logger.info("[Merge] %d masks upscaled+merged in %.2fs",
-                        len(surviving_indices), time.time() - t_merge)
+                    # Quality check: if mask covers >90% of bbox, it's likely
+                    # a "flooded" mask (SAM3 low-res artifact). Use bbox fill instead.
+                    fill_ratio = cropped.mean().item()
+                    if fill_ratio > 0.90:
+                        n_flooded += 1
+                        # Fall back to elliptical fill inside bbox (better than rectangle)
+                        crop_h, crop_w = cropped.shape
+                        yy, xx = torch.meshgrid(
+                            torch.linspace(-1, 1, crop_h),
+                            torch.linspace(-1, 1, crop_w),
+                            indexing="ij",
+                        )
+                        ellipse = ((xx ** 2 + yy ** 2) <= 1.0).float()
+                        unified_mask[ry1:ry2, rx1:rx2] = torch.max(
+                            unified_mask[ry1:ry2, rx1:rx2], ellipse)
+                    else:
+                        unified_mask[ry1:ry2, rx1:rx2] = torch.max(
+                            unified_mask[ry1:ry2, rx1:rx2], cropped)
+
+            logger.info("[Merge] %d masks upscaled+merged (%d flooded→ellipse) in %.2fs",
+                        len(surviving_indices), n_flooded, time.time() - t_merge)
         else:
             # Fallback: box-fill if no masks available
             logger.warning("[Merge] No masks available — using box fill")
@@ -708,7 +759,7 @@ class SAM3Gemstone:
                 box = all_boxes[idx_val]
                 x1, y1 = int(box[0].item()), int(box[1].item())
                 x2, y2 = int(box[2].item()), int(box[3].item())
-                unified_mask[y1:y2, x1:x2] = 1.0
+                unified_mask[max(0,y1):min(H,y2), max(0,x1):min(W,x2)] = 1.0
 
         coverage = unified_mask.mean().item() * 100
         logger.info("[Done] %d objects, coverage: %.1f%%", len(surviving_indices), coverage)

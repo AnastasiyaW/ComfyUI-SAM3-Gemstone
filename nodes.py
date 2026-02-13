@@ -196,15 +196,6 @@ class SAM3Gemstone:
         return {
             "required": {
                 "image": ("IMAGE",),
-                "prompt": ("STRING", {
-                    "default": "diamond",
-                    "multiline": True,
-                    "placeholder": "Custom prompts (one per line). Ignored when use_stone_prompts=True.",
-                }),
-                "use_stone_prompts": ("BOOLEAN", {
-                    "default": True,
-                    "tooltip": "Use 22 built-in stone prompts (gem types + cut shapes). Much better detection than single 'diamond'.",
-                }),
                 "score_threshold": ("FLOAT", {
                     "default": 0.10, "min": 0.01, "max": 1.0, "step": 0.01,
                     "display": "slider",
@@ -229,10 +220,9 @@ class SAM3Gemstone:
                 "mask_expansion": ("INT", {
                     "default": 0, "min": -50, "max": 50, "step": 1,
                 }),
-                "enable_sahi": ("BOOLEAN", {"default": True}),
-                "force_sahi": ("BOOLEAN", {
+                "enable_sahi": ("BOOLEAN", {
                     "default": True,
-                    "tooltip": "Always tile even small images (recommended for small objects like gems)",
+                    "tooltip": "Add SAHI tiling pass with tile_prompts on top of full-frame pass",
                 }),
                 "sahi_tile_size": ("INT", {
                     "default": 512, "min": 256, "max": 2048, "step": 128,
@@ -328,6 +318,16 @@ class SAM3Gemstone:
         )
         model = model.to(dtype=torch.float32)
         model.eval()
+
+        # Monkey-patch Sam3Image.device — it's a read-only @property but
+        # ModelPatcher needs to set model.device during offload/load cycles.
+        # Add a setter that writes to _device (which the getter already reads).
+        cls = type(model)
+        if isinstance(getattr(cls, "device", None), property):
+            old_prop = cls.device
+            cls.device = property(old_prop.fget, lambda self, val: setattr(self, "_device", val))
+            logger.info("Patched Sam3Image.device: added setter for ModelPatcher compatibility")
+
         logger.info("Model built on CPU, wrapping in ModelPatcher...")
 
         # Wrap in ModelPatcher — ComfyUI manages GPU offload
@@ -611,8 +611,6 @@ class SAM3Gemstone:
     def run(
         self,
         image: torch.Tensor,
-        prompt: str,
-        use_stone_prompts: bool,
         score_threshold: float,
         nms_iou_threshold: float,
         min_solidity: float,
@@ -621,7 +619,6 @@ class SAM3Gemstone:
         max_detections: int,
         mask_expansion: int,
         enable_sahi: bool,
-        force_sahi: bool,
         sahi_tile_size: int,
         sahi_overlap: float,
         morph_close_size: int,
@@ -657,17 +654,10 @@ class SAM3Gemstone:
         logger.info("Image shape: %s  dtype: %s", image.shape, image.dtype)
         logger.info("=" * 60)
 
-        # Resolve prompts
-        if use_stone_prompts:
-            prompts = STONE_PROMPTS
-            tile_prompts = TILE_PROMPTS
-            logger.info("Using built-in STONE_PROMPTS (%d prompts)", len(prompts))
-        else:
-            prompts = [p.strip() for p in prompt.strip().splitlines() if p.strip()]
-            if not prompts:
-                prompts = ["diamond"]
-            tile_prompts = prompts  # same prompts for tiles when custom
-        logger.info("Prompts (%d): %s", len(prompts), prompts)
+        # Always use built-in 22 stone prompts (full-frame) + 2 tile prompts (SAHI)
+        prompts = STONE_PROMPTS
+        tile_prompts = TILE_PROMPTS
+        logger.info("Using STONE_PROMPTS (%d) + TILE_PROMPTS (%d)", len(prompts), len(tile_prompts))
 
         B, H, W, C = image.shape
         logger.info("Batch=%d  H=%d  W=%d", B, H, W)
@@ -689,7 +679,7 @@ class SAM3Gemstone:
                         image[b_idx], processor, device, prompts, tile_prompts, H, W,
                         score_threshold, nms_iou_threshold, min_solidity,
                         min_area_pct, max_area_pct, max_detections, mask_expansion,
-                        enable_sahi, force_sahi, sahi_tile_size, sahi_overlap,
+                        enable_sahi, sahi_tile_size, sahi_overlap,
                         morph_close_size, zim_predictor,
                     )
 
@@ -743,31 +733,26 @@ class SAM3Gemstone:
         self, img_tensor_single, processor, device, prompts, tile_prompts, H, W,
         score_threshold, nms_iou_threshold, min_solidity,
         min_area_pct, max_area_pct, max_detections, mask_expansion,
-        enable_sahi, force_sahi, sahi_tile_size, sahi_overlap,
+        enable_sahi, sahi_tile_size, sahi_overlap,
         morph_close_size, zim_predictor,
     ):
         """Process one image from batch. Returns unified_mask (H, W) float tensor."""
 
         np_img = (img_tensor_single.cpu().numpy() * 255).astype(np.uint8)
 
-        need_sahi = enable_sahi and (force_sahi or max(H, W) > sahi_tile_size * 2)
-
         all_logits = []
         all_boxes = []
         all_scores = []
 
-        # Full-frame pass (skip if force tiling)
-        if not (need_sahi and force_sahi):
-            pil_img = Image.fromarray(np_img)
-            t_si = time.time()
-            state = processor.set_image(pil_img)
-            logger.info("set_image (full-frame): %.2fs", time.time() - t_si)
-            logger.info("[Full-frame] Running %d prompts...", len(prompts))
-            all_logits, all_boxes, all_scores = self._run_prompts(processor, state, prompts)
-            logger.info("[Full-frame] Total detections: %d", len(all_scores))
-            del state
-        else:
-            logger.info("[SAHI] force_sahi=True, SKIPPING full-frame pass (saves VRAM)")
+        # Full-frame pass — ALWAYS run all prompts on full image
+        pil_img = Image.fromarray(np_img)
+        t_si = time.time()
+        state = processor.set_image(pil_img)
+        logger.info("set_image (full-frame): %.2fs", time.time() - t_si)
+        logger.info("[Full-frame] Running %d prompts...", len(prompts))
+        all_logits, all_boxes, all_scores = self._run_prompts(processor, state, prompts)
+        logger.info("[Full-frame] Total detections: %d", len(all_scores))
+        del state
 
         # SAHI tiling
         if need_sahi:
@@ -931,39 +916,21 @@ class ZIMRefineMask:
     ZIM only replaces pixels in the edge band around each object contour.
     If ZIM can't find the object → fallback to original mask edges."""
 
+    # Presets: chain_mode=True → tiny min_object_area for chain links
+    PRESET_NORMAL = {"min_object_area": 50, "crop_padding": 30, "large_object_pct": 5.0,
+                     "band_outer": 10, "zim_min_coverage": 0.10}
+    PRESET_CHAIN = {"min_object_area": 5, "crop_padding": 15, "large_object_pct": 3.0,
+                    "band_outer": 6, "zim_min_coverage": 0.05}
+
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
                 "image": ("IMAGE",),
                 "mask": ("MASK",),
-                "min_object_area": ("INT", {
-                    "default": 20, "min": 5, "max": 100000, "step": 5,
-                    "tooltip": "Min object area in pixels (skip tiny noise). Low = detect chain links.",
-                }),
-                "crop_padding": ("INT", {
-                    "default": 30, "min": 0, "max": 200, "step": 5,
-                    "tooltip": "Pixels of padding around large object bbox for ZIM crop",
-                }),
-                "large_object_pct": ("FLOAT", {
-                    "default": 5.0, "min": 1.0, "max": 50.0, "step": 1.0,
-                    "tooltip": "Objects above this % of image area get individual crops",
-                }),
-                "band_inner": ("INT", {
-                    "default": 5, "min": 1, "max": 30, "step": 1,
-                    "tooltip": "Edge band width INSIDE the mask contour (pixels)",
-                }),
-                "band_outer": ("INT", {
-                    "default": 10, "min": 1, "max": 50, "step": 1,
-                    "tooltip": "Edge band width OUTSIDE the mask contour (pixels)",
-                }),
-                "zim_min_coverage": ("FLOAT", {
-                    "default": 0.10, "min": 0.0, "max": 1.0, "step": 0.05,
-                    "tooltip": "Min ZIM coverage within object to accept (0=always accept ZIM, 1=always fallback)",
-                }),
-                "contour_smooth": ("FLOAT", {
-                    "default": 1.0, "min": 0.0, "max": 5.0, "step": 0.1,
-                    "tooltip": "Contour smoothing strength (0=off). Redraw mask with smooth vector-like edges.",
+                "chain_mode": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Enable for chains/small links. Uses tiny min_object_area and tighter settings.",
                 }),
             },
         }
@@ -973,13 +940,21 @@ class ZIMRefineMask:
     FUNCTION = "run"
     CATEGORY = "SAM3-Gemstone"
 
-    def run(self, image, mask, min_object_area, crop_padding, large_object_pct,
-            band_inner, band_outer, zim_min_coverage, contour_smooth):
+    def run(self, image, mask, chain_mode):
         t0 = time.time()
         B, H, W, C = image.shape
+
+        # Select preset
+        p = self.PRESET_CHAIN if chain_mode else self.PRESET_NORMAL
+        min_object_area = p["min_object_area"]
+        crop_padding = p["crop_padding"]
+        large_object_pct = p["large_object_pct"]
+        band_outer = p["band_outer"]
+        zim_min_coverage = p["zim_min_coverage"]
+
         logger.info("=" * 60)
-        logger.info("[ZIM-Refine] START  B=%d  H=%d  W=%d  band=%d/%d  min_area=%d",
-                    B, H, W, band_inner, band_outer, min_object_area)
+        logger.info("[ZIM-Refine] START  B=%d  H=%d  W=%d  chain_mode=%s  min_area=%d  band_outer=%d",
+                    B, H, W, chain_mode, min_object_area, band_outer)
 
         predictor = _load_zim_model()
 
@@ -1120,10 +1095,6 @@ class ZIMRefineMask:
                         unified_alpha, (labels == label_id).astype(np.float32))
 
             logger.info("[ZIM-Refine] Refined: %d, Fallback: %d", zim_refined, zim_fallback)
-
-            # Optional contour smoothing
-            if contour_smooth > 0:
-                unified_alpha = _smooth_mask_contours(unified_alpha, contour_smooth)
 
             refined_mask = torch.from_numpy(unified_alpha).clamp(0, 1)
 

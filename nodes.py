@@ -129,8 +129,8 @@ class SAM3GemstoneModelLoader:
             load_from_HF=False,
             compile=compile_model,
         )
-        logger.info("Model built. Moving to dtype=%s ...", dtype)
-        model = model.to(dtype=dtype)
+        logger.info("Model built. Moving to device=%s dtype=%s ...", device, dtype)
+        model = model.to(device=device, dtype=dtype)
         model.eval()
 
         first_param = next(model.parameters())

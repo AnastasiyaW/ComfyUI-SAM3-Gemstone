@@ -29,7 +29,16 @@ SAM3_MODEL_DIR = os.path.join(folder_paths.models_dir, "sam3")
 os.makedirs(SAM3_MODEL_DIR, exist_ok=True)
 SAM3_CHECKPOINT = "sam3.pt"
 
+ZIM_MODEL_DIR = os.path.join(folder_paths.models_dir, "zim")
+os.makedirs(ZIM_MODEL_DIR, exist_ok=True)
+ZIM_BACKBONE = "vit_b"
+ZIM_CKPT_SUBDIR = "zim_vit_b_2043"
+
 _sam3_cache: dict = {}
+_zim_cache: dict = {}
+
+# Threshold: objects above this % of image area get cropped for ZIM (higher resolution)
+ZIM_LARGE_OBJECT_PCT = 5.0
 
 
 # ============================================================================
@@ -37,7 +46,8 @@ _sam3_cache: dict = {}
 # ============================================================================
 class SAM3Gemstone:
     """All-in-one SAM3 gemstone segmentation node.
-    Loads model (cached), segments gemstones, outputs mask + overlay + stats."""
+    Loads model (cached), segments gemstones, optionally refines edges with ZIM,
+    outputs mask + overlay + stats."""
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -83,6 +93,7 @@ class SAM3Gemstone:
                 "morph_close_size": ("INT", {
                     "default": 3, "min": 0, "max": 15, "step": 2,
                 }),
+                "use_zim_refinement": ("BOOLEAN", {"default": False}),
                 "keep_model_loaded": ("BOOLEAN", {"default": True}),
                 "compile_model": ("BOOLEAN", {"default": False}),
             },
@@ -95,7 +106,7 @@ class SAM3Gemstone:
     OUTPUT_NODE = True
 
     # =====================================================================
-    #  Model loading (cached)
+    #  SAM3 Model loading (cached)
     # =====================================================================
     def _load_model(self, compile_model: bool):
         t0 = time.time()
@@ -171,6 +182,140 @@ class SAM3Gemstone:
 
         logger.info("LOAD DONE in %.1fs", time.time() - t0)
         return pipe
+
+    # =====================================================================
+    #  ZIM Model loading (cached)
+    # =====================================================================
+    def _load_zim(self):
+        if "zim" in _zim_cache:
+            logger.info("Returning cached ZIM predictor")
+            return _zim_cache["zim"]
+
+        t0 = time.time()
+        logger.info("[ZIM] Loading ZIM model (backbone=%s)...", ZIM_BACKBONE)
+
+        from zim_anything import zim_model_registry, ZimPredictor
+
+        ckpt_dir = os.path.join(ZIM_MODEL_DIR, ZIM_CKPT_SUBDIR)
+        encoder_path = os.path.join(ckpt_dir, "encoder.onnx")
+        decoder_path = os.path.join(ckpt_dir, "decoder.onnx")
+
+        assert os.path.isfile(encoder_path), (
+            f"ZIM encoder NOT FOUND: {encoder_path}. "
+            f"Download from HuggingFace naver-iv/zim-anything-vitb"
+        )
+        assert os.path.isfile(decoder_path), (
+            f"ZIM decoder NOT FOUND: {decoder_path}. "
+            f"Download from HuggingFace naver-iv/zim-anything-vitb"
+        )
+
+        enc_mb = os.path.getsize(encoder_path) / (1024**2)
+        dec_mb = os.path.getsize(decoder_path) / (1024**2)
+        logger.info("[ZIM] Encoder: %.1f MB, Decoder: %.1f MB", enc_mb, dec_mb)
+
+        zim_model = zim_model_registry[ZIM_BACKBONE](checkpoint=ckpt_dir)
+        if torch.cuda.is_available():
+            zim_model.cuda()
+        predictor = ZimPredictor(zim_model)
+
+        _zim_cache["zim"] = predictor
+        logger.info("[ZIM] Loaded in %.1fs", time.time() - t0)
+        return predictor
+
+    # =====================================================================
+    #  ZIM refinement — process surviving detections
+    # =====================================================================
+    def _refine_with_zim(self, zim_predictor, np_img, surviving, all_boxes, all_logits, H, W):
+        """Replace SAM3 logits with ZIM alpha mattes for each surviving detection.
+
+        Strategy:
+        - Small objects (<5% image area): set_image() once on full image, iterate predict(box=bbox)
+        - Large objects (>=5%): crop around bbox, set_image() on crop for higher resolution
+
+        Returns: list of refined logits (same indices as surviving)
+        """
+        t0 = time.time()
+        image_area = H * W
+        refined_logits = {}
+
+        # Separate into small and large objects
+        small_indices = []
+        large_indices = []
+        for gi in surviving:
+            box = all_boxes[gi]
+            bw = (box[2] - box[0]).item()
+            bh = (box[3] - box[1]).item()
+            box_area_pct = (bw * bh) / image_area * 100
+            if box_area_pct >= ZIM_LARGE_OBJECT_PCT:
+                large_indices.append(gi)
+            else:
+                small_indices.append(gi)
+
+        logger.info("[ZIM] %d small + %d large objects to refine", len(small_indices), len(large_indices))
+
+        # --- Small objects: single set_image on full image, iterate bboxes ---
+        if small_indices:
+            t_enc = time.time()
+            zim_predictor.set_image(np_img)  # RGB uint8 HWC
+            logger.info("[ZIM] Full-image encoder: %.2fs", time.time() - t_enc)
+
+            for idx, gi in enumerate(small_indices):
+                box = all_boxes[gi]
+                x1, y1, x2, y2 = box[0].item(), box[1].item(), box[2].item(), box[3].item()
+                bbox_np = np.array([x1, y1, x2, y2], dtype=np.float32)
+
+                masks, scores, _ = zim_predictor.predict(
+                    box=bbox_np,
+                    multimask_output=False,
+                )
+                # masks shape: (1, H, W) float
+                alpha = masks[0].astype(np.float32)
+                refined_logits[gi] = torch.from_numpy(alpha)
+
+                if (idx + 1) % 50 == 0:
+                    logger.info("[ZIM] Small objects: %d/%d done", idx + 1, len(small_indices))
+
+            logger.info("[ZIM] %d small objects refined (%.2fs)",
+                        len(small_indices), time.time() - t_enc)
+
+        # --- Large objects: crop each, set_image on crop ---
+        if large_indices:
+            t_large = time.time()
+            pad = 20  # pixels padding around bbox
+
+            for gi in large_indices:
+                box = all_boxes[gi]
+                x1 = max(0, int(box[0].item()) - pad)
+                y1 = max(0, int(box[1].item()) - pad)
+                x2 = min(W, int(box[2].item()) + pad)
+                y2 = min(H, int(box[3].item()) + pad)
+
+                crop = np_img[y1:y2, x1:x2].copy()
+                zim_predictor.set_image(crop)
+
+                # Bbox in crop-local coords
+                local_box = np.array([
+                    box[0].item() - x1,
+                    box[1].item() - y1,
+                    box[2].item() - x1,
+                    box[3].item() - y1,
+                ], dtype=np.float32)
+
+                masks, scores, _ = zim_predictor.predict(
+                    box=local_box,
+                    multimask_output=False,
+                )
+
+                # Place crop mask back into full-image coordinates
+                full_alpha = np.zeros((H, W), dtype=np.float32)
+                full_alpha[y1:y2, x1:x2] = masks[0].astype(np.float32)
+                refined_logits[gi] = torch.from_numpy(full_alpha)
+
+            logger.info("[ZIM] %d large objects refined (%.2fs)",
+                        len(large_indices), time.time() - t_large)
+
+        logger.info("[ZIM] Total refinement: %.2fs for %d objects", time.time() - t0, len(surviving))
+        return refined_logits
 
     # =====================================================================
     #  Helpers
@@ -296,6 +441,7 @@ class SAM3Gemstone:
         sahi_tile_size: int,
         sahi_overlap: float,
         morph_close_size: int,
+        use_zim_refinement: bool,
         keep_model_loaded: bool,
         compile_model: bool,
     ):
@@ -306,8 +452,17 @@ class SAM3Gemstone:
         model = pipe["model"]
         device = pipe["device"]
 
+        # --- Load ZIM if requested ---
+        zim_predictor = None
+        if use_zim_refinement:
+            try:
+                zim_predictor = self._load_zim()
+            except Exception as e:
+                logger.error("[ZIM] Failed to load ZIM model: %s — continuing without refinement", e)
+                zim_predictor = None
+
         logger.info("=" * 60)
-        logger.info("SEGMENT START  device=%s", device)
+        logger.info("SEGMENT START  device=%s  zim=%s", device, zim_predictor is not None)
         logger.info("Image shape: %s  dtype: %s", image.shape, image.dtype)
         logger.info("=" * 60)
 
@@ -502,6 +657,19 @@ class SAM3Gemstone:
                         _, topk_idx = surv_scores.topk(max_detections)
                         surviving = [surviving[i] for i in topk_idx]
                         logger.info("[Top-K] Clamped to %d detections", max_detections)
+
+                    # 7.5 ZIM refinement — replace SAM3 logits with ZIM alpha mattes
+                    if zim_predictor is not None and len(surviving) > 0:
+                        try:
+                            refined = self._refine_with_zim(
+                                zim_predictor, np_img, surviving, all_boxes, all_logits, H, W
+                            )
+                            for gi, refined_logit in refined.items():
+                                all_logits[gi] = refined_logit
+                            logger.info("[ZIM] Replaced %d/%d logits with ZIM alpha mattes",
+                                        len(refined), len(surviving))
+                        except Exception as e:
+                            logger.error("[ZIM] Refinement failed: %s — using SAM3 masks", e)
 
                     # 8. Soft max-union merge
                     if len(surviving) == 0:

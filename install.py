@@ -30,6 +30,19 @@ def main():
         print("[SAM3-Gemstone] torchvision not found (needed for NMS). Installing...")
         pip_install("torchvision")
 
+    # ZIM (optional — for edge refinement)
+    try:
+        from zim_anything import ZimPredictor  # noqa: F401
+    except ImportError:
+        print("[SAM3-Gemstone] Installing zim_anything (ZIM edge refinement)...")
+        # ZIM requires segment-anything from git
+        try:
+            from segment_anything import SamPredictor  # noqa: F401
+        except ImportError:
+            print("[SAM3-Gemstone] Installing segment-anything (ZIM dependency)...")
+            pip_install("git+https://github.com/facebookresearch/segment-anything.git")
+        pip_install("--no-deps", "zim_anything")
+
     print("[SAM3-Gemstone] Dependencies OK.")
 
 

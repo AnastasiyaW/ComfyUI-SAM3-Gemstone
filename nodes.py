@@ -730,25 +730,31 @@ class SAM3Gemstone:
 
                 if lx2 > lx1 and ly2 > ly1:
                     cropped = mask_up[ly1:ly2, lx1:lx2]
+                    # Ensure target region matches cropped size exactly
+                    # (bbox may clip at tile edge vs image edge differently)
+                    th = min(cropped.shape[0], ry2 - ry1)
+                    tw = min(cropped.shape[1], rx2 - rx1)
+                    cropped = cropped[:th, :tw]
+                    ry2_safe = ry1 + th
+                    rx2_safe = rx1 + tw
 
                     # Quality check: if mask covers >90% of bbox, it's likely
-                    # a "flooded" mask (SAM3 low-res artifact). Use bbox fill instead.
+                    # a "flooded" mask (SAM3 low-res artifact). Use ellipse instead.
                     fill_ratio = cropped.mean().item()
                     if fill_ratio > 0.90:
                         n_flooded += 1
-                        # Fall back to elliptical fill inside bbox (better than rectangle)
-                        crop_h, crop_w = cropped.shape
+                        # Fall back to elliptical fill inside bbox
                         yy, xx = torch.meshgrid(
-                            torch.linspace(-1, 1, crop_h),
-                            torch.linspace(-1, 1, crop_w),
+                            torch.linspace(-1, 1, th),
+                            torch.linspace(-1, 1, tw),
                             indexing="ij",
                         )
                         ellipse = ((xx ** 2 + yy ** 2) <= 1.0).float()
-                        unified_mask[ry1:ry2, rx1:rx2] = torch.max(
-                            unified_mask[ry1:ry2, rx1:rx2], ellipse)
+                        unified_mask[ry1:ry2_safe, rx1:rx2_safe] = torch.max(
+                            unified_mask[ry1:ry2_safe, rx1:rx2_safe], ellipse)
                     else:
-                        unified_mask[ry1:ry2, rx1:rx2] = torch.max(
-                            unified_mask[ry1:ry2, rx1:rx2], cropped)
+                        unified_mask[ry1:ry2_safe, rx1:rx2_safe] = torch.max(
+                            unified_mask[ry1:ry2_safe, rx1:rx2_safe], cropped)
 
             logger.info("[Merge] %d masks upscaled+merged (%d flooded→ellipse) in %.2fs",
                         len(surviving_indices), n_flooded, time.time() - t_merge)

@@ -321,6 +321,56 @@ class SAM3Gemstone:
         from sam3.model.sam3_image_processor import Sam3Processor
         processor = Sam3Processor(model, confidence_threshold=0.01)
 
+        # Monkey-patch: remove presence_logit_dec multiplier that crushes scores
+        # for rare categories like jewelry/gemstones (0.4-0.8 -> 0.03-0.06).
+        # We use raw pred_logits.sigmoid() instead.
+        import types
+        from sam3.model.utils.box_ops import box_cxcywh_to_xyxy
+        from torch.nn.functional import interpolate as F_interpolate
+
+        @torch.inference_mode()
+        def _forward_grounding_no_presence(self_proc, state):
+            outputs = self_proc.model.forward_grounding(
+                backbone_out=state["backbone_out"],
+                find_input=self_proc.find_stage,
+                geometric_prompt=state["geometric_prompt"],
+                find_target=None,
+            )
+            out_bbox = outputs["pred_boxes"]
+            out_logits = outputs["pred_logits"]
+            out_masks = outputs["pred_masks"]
+
+            # Use raw sigmoid scores WITHOUT presence multiplier
+            out_probs = out_logits.sigmoid().squeeze(-1)
+
+            presence_raw = outputs["presence_logit_dec"].sigmoid().item()
+            logger.debug("  presence_logit_dec sigmoid = %.4f (NOT applied to scores)", presence_raw)
+
+            keep = out_probs > self_proc.confidence_threshold
+            out_probs = out_probs[keep]
+            out_masks = out_masks[keep]
+            out_bbox = out_bbox[keep]
+
+            boxes = box_cxcywh_to_xyxy(out_bbox)
+            img_h = state["original_height"]
+            img_w = state["original_width"]
+            scale_fct = torch.tensor([img_w, img_h, img_w, img_h]).to(self_proc.device)
+            boxes = boxes * scale_fct[None, :]
+
+            out_masks = F_interpolate(
+                out_masks.unsqueeze(1), (img_h, img_w),
+                mode="bilinear", align_corners=False,
+            ).sigmoid()
+
+            state["masks_logits"] = out_masks
+            state["masks"] = out_masks > 0.5
+            state["boxes"] = boxes
+            state["scores"] = out_probs
+            return state
+
+        processor._forward_grounding = types.MethodType(_forward_grounding_no_presence, processor)
+        logger.info("Patched Sam3Processor: presence_logit_dec multiplier DISABLED")
+
         model.to(device)
         B, H, W, C = image.shape
         logger.info("Batch=%d  H=%d  W=%d", B, H, W)

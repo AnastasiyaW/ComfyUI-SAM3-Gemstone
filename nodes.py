@@ -145,6 +145,12 @@ class SAM3Gemstone:
                     "default": True,
                     "tooltip": "Refine each detection's edges with ZIM (pixel-perfect alpha matting)",
                 }),
+                "mask_threshold": ("FLOAT", {
+                    "default": 0.5, "min": 0.0, "max": 1.0, "step": 0.05,
+                    "tooltip": "Alpha threshold: 0.0 = soft sigmoid (smooth edges), "
+                               "0.5 = crisp binary (best for small gems), "
+                               "values in between = partial binarization",
+                }),
                 "score_threshold": ("FLOAT", {
                     "default": 0.10, "min": 0.01, "max": 1.0, "step": 0.01,
                     "tooltip": "Minimum confidence score to keep a detection",
@@ -317,40 +323,58 @@ class SAM3Gemstone:
     # =====================================================================
     #  ZIM segmentation — raw sigmoid alpha (no post-processing)
     # =====================================================================
+    # Size thresholds for adaptive ZIM strategy
+    _TINY_BBOX_PX = 24     # Below this: box-only prompt, always binarize
+    _SMALL_BBOX_PX = 64    # Below this: box + single center fg point
+    # Above _SMALL_BBOX_PX: full rich prompts (5 fg + 4 bg)
+
     def _segment_with_zim(self, zim_predictor, np_img: np.ndarray,
-                          boxes: list[torch.Tensor], H: int, W: int) -> torch.Tensor:
-        """Segment each detection with ZIM alpha matting (no SAM3 masks needed).
+                          boxes: list[torch.Tensor], H: int, W: int,
+                          mask_threshold: float = 0.5) -> torch.Tensor:
+        """Segment each detection with ZIM alpha matting.
 
-        SAM3 = detector only (boxes). ZIM crops around each box with padding
-        and produces sigmoid alpha [0,1] masks directly — no post-processing.
+        Size-adaptive strategy:
+        - TINY  (bbox < 24px): box-only prompt → hard binary attention → binarize.
+          ZIM's soft Gaussian attention is too broad for objects this small.
+          Box prompt gives hard binary mask in 64×64 attention space = better focus.
+        - SMALL (bbox < 64px): box + single center fg point → binarize.
+          One Gaussian is enough to guide ZIM; more points would overlap.
+        - LARGE (bbox >= 64px): box + 5 fg + 4 bg points → raw sigmoid or threshold.
+          Full rich prompts with soft Gaussian attention for smooth edges.
 
-        ZIM's sigmoid output is already smooth and high-quality:
-        - Decoder produces logits at 256×256
-        - Bilinear upscale: 256 → 512 → 1024 → original crop size
-        - .sigmoid() converts to continuous [0,1] alpha
-
-        Point prompts create soft Gaussian attention (sigma=6) in ZIM's
-        64×64 attention space — this gives ZIM spatial focus for each object.
-        Multiple fg points + adaptive bg margin maximize mask quality.
-
-        multimask_output=True returns 4 masks + IoU scores — we pick the best.
+        mask_threshold controls output:
+        - 0.0 = raw sigmoid (smooth [0,1] alpha, soft edges)
+        - 0.5 = crisp binary (best for small gems, clean overlay)
+        - in between = partial: soft above threshold, hard below
         """
         t0 = time.time()
-        MIN_PAD = 15
-        MAX_PAD = 60
         unified_mask = torch.zeros(H, W, dtype=torch.float32)
 
-        logger.info("[ZIM] Segmenting %d objects (multimask + best IoU, raw sigmoid)", len(boxes))
+        n_tiny = sum(1 for b in boxes if max(b[2].item()-b[0].item(), b[3].item()-b[1].item()) < self._TINY_BBOX_PX)
+        n_small = sum(1 for b in boxes if self._TINY_BBOX_PX <= max(b[2].item()-b[0].item(), b[3].item()-b[1].item()) < self._SMALL_BBOX_PX)
+        n_large = len(boxes) - n_tiny - n_small
+        logger.info("[ZIM] Segmenting %d objects (tiny=%d small=%d large=%d, threshold=%.2f)",
+                    len(boxes), n_tiny, n_small, n_large, mask_threshold)
 
         for idx, box in enumerate(boxes):
             bx1, by1 = box[0].item(), box[1].item()
             bx2, by2 = box[2].item(), box[3].item()
 
-            # Adaptive padding: 30% of bbox size, clamped to [MIN_PAD, MAX_PAD]
             bbox_w = bx2 - bx1
             bbox_h = by2 - by1
             bbox_size = max(bbox_w, bbox_h)
-            pad = int(max(MIN_PAD, min(MAX_PAD, bbox_size * 0.3)))
+
+            # Adaptive padding: small gems get proportionally more padding
+            # so they fill more of ZIM's 1024×1024 internal resolution.
+            if bbox_size < self._TINY_BBOX_PX:
+                # Tiny: pad generously so the crop is at least ~80-100px
+                pad = max(30, int(bbox_size * 1.5))
+            elif bbox_size < self._SMALL_BBOX_PX:
+                # Small: moderate padding
+                pad = max(20, int(bbox_size * 0.5))
+            else:
+                # Large: 30% padding, clamped
+                pad = int(max(15, min(60, bbox_size * 0.3)))
 
             # Crop around detection bbox with padding
             x1 = max(0, int(bx1) - pad)
@@ -363,53 +387,69 @@ class SAM3Gemstone:
 
             local_box = np.array([bx1 - x1, by1 - y1, bx2 - x1, by2 - y1], dtype=np.float32)
             lx1, ly1, lx2, ly2 = local_box
-
-            # --- Build rich point prompts for ZIM's soft Gaussian attention ---
-            # Foreground: center + 4 quadrant points inside bbox
             cx = (lx1 + lx2) / 2
             cy = (ly1 + ly2) / 2
-            qx = (lx2 - lx1) * 0.25  # quarter offsets
-            qy = (ly2 - ly1) * 0.25
 
-            fg_points = [
-                [cx, cy],                # center
-                [cx - qx, cy - qy],      # top-left quadrant
-                [cx + qx, cy - qy],      # top-right quadrant
-                [cx - qx, cy + qy],      # bottom-left quadrant
-                [cx + qx, cy + qy],      # bottom-right quadrant
-            ]
+            # --- Size-adaptive prompt strategy ---
+            if bbox_size < self._TINY_BBOX_PX:
+                # TINY: box-only → hard binary attention in ZIM's 64×64 space.
+                # No points = no soft Gaussian bleed. multimask_output=False
+                # because box is unambiguous for a single small object.
+                masks, iou_scores, _ = zim_predictor.predict(
+                    box=local_box, multimask_output=False,
+                )
+                best_alpha = masks[0].astype(np.float32)
 
-            # Background: 4 points outside bbox with adaptive margin
-            # Margin scales with bbox size — larger objects need more spacing
-            crop_h, crop_w = y2 - y1, x2 - x1
-            bg_margin = max(5, int(bbox_size * 0.1))
+            elif bbox_size < self._SMALL_BBOX_PX:
+                # SMALL: box + single center fg point.
+                # One Gaussian centered on the gem + box constraint.
+                pt_coords = np.array([[cx, cy]], dtype=np.float32)
+                pt_labels = np.array([1], dtype=np.int32)
+                masks, iou_scores, _ = zim_predictor.predict(
+                    point_coords=pt_coords, point_labels=pt_labels,
+                    box=local_box, multimask_output=True,
+                )
+                best_idx = int(np.argmax(iou_scores))
+                best_alpha = masks[best_idx].astype(np.float32)
 
-            bg_points = [
-                [max(0, lx1 - bg_margin), cy],                     # left
-                [min(crop_w - 1, lx2 + bg_margin), cy],            # right
-                [cx, max(0, ly1 - bg_margin)],                     # top
-                [cx, min(crop_h - 1, ly2 + bg_margin)],            # bottom
-            ]
+            else:
+                # LARGE: full rich prompts — 5 fg + 4 bg points.
+                qx = (lx2 - lx1) * 0.25
+                qy = (ly2 - ly1) * 0.25
+                crop_h, crop_w = y2 - y1, x2 - x1
+                bg_margin = max(5, int(bbox_size * 0.1))
 
-            pt_coords = np.array(fg_points + bg_points, dtype=np.float32)
-            pt_labels = np.array([1] * len(fg_points) + [0] * len(bg_points), dtype=np.int32)
+                fg_points = [
+                    [cx, cy],
+                    [cx - qx, cy - qy], [cx + qx, cy - qy],
+                    [cx - qx, cy + qy], [cx + qx, cy + qy],
+                ]
+                bg_points = [
+                    [max(0, lx1 - bg_margin), cy],
+                    [min(crop_w - 1, lx2 + bg_margin), cy],
+                    [cx, max(0, ly1 - bg_margin)],
+                    [cx, min(crop_h - 1, ly2 + bg_margin)],
+                ]
 
-            # multimask_output=True → 4 masks + IoU scores, pick best
-            masks, iou_scores, _ = zim_predictor.predict(
-                point_coords=pt_coords, point_labels=pt_labels,
-                box=local_box, multimask_output=True,
-            )
+                pt_coords = np.array(fg_points + bg_points, dtype=np.float32)
+                pt_labels = np.array([1] * 5 + [0] * 4, dtype=np.int32)
+                masks, iou_scores, _ = zim_predictor.predict(
+                    point_coords=pt_coords, point_labels=pt_labels,
+                    box=local_box, multimask_output=True,
+                )
+                best_idx = int(np.argmax(iou_scores))
+                best_alpha = masks[best_idx].astype(np.float32)
 
-            # Select mask with highest predicted IoU
-            best_idx = int(np.argmax(iou_scores))
-            best_alpha = masks[best_idx].astype(np.float32)
+            # --- Apply threshold ---
+            # For tiny/small gems, ALWAYS binarize (soft sigmoid bleeds outside).
+            # For large gems, respect user's mask_threshold setting.
+            if bbox_size < self._SMALL_BBOX_PX:
+                # Force binary for small objects — sigmoid too soft
+                best_alpha = (best_alpha > 0.5).astype(np.float32)
+            elif mask_threshold > 0.0:
+                best_alpha = (best_alpha > mask_threshold).astype(np.float32)
+            # else: mask_threshold == 0.0 → keep raw sigmoid
 
-            logger.debug("  [ZIM] obj %d: best_mask=%d iou=%.3f (all: %s)",
-                         idx, best_idx, iou_scores[best_idx],
-                         ", ".join(f"{s:.3f}" for s in iou_scores))
-
-            # Use raw ZIM sigmoid directly — no post-processing needed.
-            # ZIM's bilinear upscale + sigmoid already produces smooth alpha.
             crop_alpha = torch.from_numpy(best_alpha)
             unified_mask[y1:y2, x1:x2] = torch.max(
                 unified_mask[y1:y2, x1:x2], crop_alpha)
@@ -506,6 +546,7 @@ class SAM3Gemstone:
         tile_prompts: str,
         sahi_tile_size: int,
         use_zim_refinement: bool,
+        mask_threshold: float = 0.5,
         score_threshold: float = 0.10,
         nms_iou_threshold: float = 0.50,
     ):
@@ -574,7 +615,7 @@ class SAM3Gemstone:
                         score_threshold, nms_iou_threshold,
                         min_area_pct, max_area_pct, max_detections,
                         enable_sahi, sahi_tile_size, sahi_overlap,
-                        zim_predictor,
+                        zim_predictor, mask_threshold,
                     )
 
                 # Stats
@@ -629,7 +670,7 @@ class SAM3Gemstone:
         score_threshold: float, nms_iou_threshold: float,
         min_area_pct: float, max_area_pct: float, max_detections: int,
         enable_sahi: bool, sahi_tile_size: int, sahi_overlap: float,
-        zim_predictor,
+        zim_predictor, mask_threshold: float = 0.5,
     ) -> torch.Tensor:
         """Process one image. SAM3 = detector (boxes only), ZIM = segmentor (alpha).
 
@@ -742,7 +783,7 @@ class SAM3Gemstone:
         # --- ZIM segmentation: bbox crops → alpha masks ---
         if zim_predictor is not None:
             unified_mask = self._segment_with_zim(
-                zim_predictor, np_img, surviving_boxes, H, W)
+                zim_predictor, np_img, surviving_boxes, H, W, mask_threshold)
         else:
             # Fallback: no ZIM — create binary box masks
             unified_mask = torch.zeros(H, W, dtype=torch.float32)

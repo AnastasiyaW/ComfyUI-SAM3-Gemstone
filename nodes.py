@@ -107,81 +107,6 @@ def _load_zim_model():
     return predictor
 
 
-# ---------------------------------------------------------------------------
-# Shared helper: build edge band for ZIM refinement
-# ---------------------------------------------------------------------------
-def _build_edge_band(obj_mask_u8, band_inner, band_outer):
-    """Build a soft edge band around the contour of obj_mask.
-
-    Returns float32 mask where:
-    - interior (far from edge) = 0  (keep original mask)
-    - edge band = 1  (replace with ZIM alpha)
-    - exterior (far from edge) = 0
-    """
-    kern_outer = cv2.getStructuringElement(
-        cv2.MORPH_ELLIPSE, (band_outer * 2 + 1, band_outer * 2 + 1)
-    )
-    kern_inner = cv2.getStructuringElement(
-        cv2.MORPH_ELLIPSE, (band_inner * 2 + 1, band_inner * 2 + 1)
-    )
-
-    dilated = cv2.dilate(obj_mask_u8, kern_outer, iterations=1)
-    eroded = cv2.erode(obj_mask_u8, kern_inner, iterations=1)
-
-    band = np.clip(dilated.astype(np.float32) - eroded.astype(np.float32), 0, 1)
-
-    blur_size = max(3, (band_outer + band_inner) | 1)
-    band = cv2.GaussianBlur(band, (blur_size, blur_size), 0)
-
-    return band
-
-
-# ---------------------------------------------------------------------------
-# Smooth mask contours — vector-like clean edges without blur or aliasing
-# ---------------------------------------------------------------------------
-def _smooth_mask_contours(mask_f32, epsilon_factor=1.0):
-    """Redraw mask with smoothed contours for clean vector-like edges.
-
-    1. Binarize mask
-    2. Find contours
-    3. Approximate each contour with cv2.approxPolyDP (simplify jagged edges)
-    4. Redraw all contours filled, with cv2.LINE_AA antialiasing
-    5. Result: smooth edges, no jagging, no blur
-
-    epsilon_factor: controls smoothing strength.
-        Higher = smoother (more simplification). 1.0 = good default.
-        0.5 = less smoothing (closer to original). 2.0+ = very smooth.
-    """
-    binary = (mask_f32 > 0.5).astype(np.uint8) * 255
-
-    contours, hierarchy = cv2.findContours(binary, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
-
-    if not contours:
-        return mask_f32
-
-    # Create clean output
-    H, W = mask_f32.shape
-    smooth = np.zeros((H, W), dtype=np.uint8)
-
-    smoothed_contours = []
-    for cnt in contours:
-        # Perimeter-based epsilon — larger contours get proportionally more smoothing
-        perimeter = cv2.arcLength(cnt, closed=True)
-        epsilon = epsilon_factor * 0.002 * perimeter  # 0.2% of perimeter per factor unit
-        approx = cv2.approxPolyDP(cnt, epsilon, closed=True)
-        smoothed_contours.append(approx)
-
-    # Redraw using hierarchy to handle holes correctly
-    if hierarchy is not None:
-        cv2.drawContours(smooth, smoothed_contours, -1, 255, thickness=cv2.FILLED,
-                         lineType=cv2.LINE_AA, hierarchy=hierarchy)
-    else:
-        cv2.drawContours(smooth, smoothed_contours, -1, 255, thickness=cv2.FILLED,
-                         lineType=cv2.LINE_AA)
-
-    return smooth.astype(np.float32) / 255.0
-
-
 # ============================================================================
 #  SINGLE NODE — SAM3 Gemstone Segmentation
 # ============================================================================
@@ -382,9 +307,48 @@ class SAM3Gemstone:
     # =====================================================================
     #  ZIM refinement — refine edges of surviving detections
     #  Strategy: Use ZIM alpha DIRECTLY per detection bbox.
-    #  ZIM produces pixel-perfect edges natively. Constrain to dilated
-    #  SAM3 zone to prevent bleeding into neighbor objects.
+    #  ZIM produces pixel-perfect sigmoid [0,1] alpha natively.
+    #  We feed box + point prompts derived from SAM3 mask (centroid as
+    #  foreground, corners outside mask as background) for best results.
+    #  Constrain to dilated SAM3 zone to prevent bleeding into neighbors.
     # =====================================================================
+    @staticmethod
+    def _sam3_mask_to_points(sam3_np, box, H, W, n_bg=4):
+        """Extract point prompts from SAM3 binary mask for ZIM.
+
+        Returns (point_coords Nx2, point_labels N) or (None, None) if mask empty.
+        - 1 foreground point: centroid of the mask
+        - n_bg background points: midpoints of box edges outside the mask
+        """
+        ys, xs = np.where(sam3_np > 0)
+        if len(ys) == 0:
+            return None, None
+
+        # Foreground: centroid of the mask pixels
+        cx = float(xs.mean())
+        cy = float(ys.mean())
+
+        bx1, by1, bx2, by2 = box[0].item(), box[1].item(), box[2].item(), box[3].item()
+        bw = bx2 - bx1
+        bh = by2 - by1
+
+        # Background: 4 points just outside each box edge (clamped to image)
+        margin = 3  # pixels outside the box
+        bg_candidates = [
+            (max(0, bx1 - margin), (by1 + by2) / 2),     # left of box
+            (min(W - 1, bx2 + margin), (by1 + by2) / 2),  # right of box
+            ((bx1 + bx2) / 2, max(0, by1 - margin)),      # above box
+            ((bx1 + bx2) / 2, min(H - 1, by2 + margin)),  # below box
+        ]
+
+        coords = [[cx, cy]]
+        labels = [1]  # foreground
+        for bx, by in bg_candidates[:n_bg]:
+            coords.append([bx, by])
+            labels.append(0)  # background
+
+        return np.array(coords, dtype=np.float32), np.array(labels, dtype=np.int32)
+
     def _refine_with_zim(self, zim_predictor, np_img, surviving, all_boxes, all_logits, H, W):
         t0 = time.time()
         image_area = H * W
@@ -416,14 +380,25 @@ class SAM3Gemstone:
                 box = all_boxes[gi]
                 bbox_np = np.array([box[0].item(), box[1].item(),
                                     box[2].item(), box[3].item()], dtype=np.float32)
-                masks, scores, _ = zim_predictor.predict(box=bbox_np, multimask_output=False)
-                zim_alpha = masks[0].astype(np.float32)
 
                 sam3_mask = all_logits[gi]
                 if isinstance(sam3_mask, torch.Tensor):
                     sam3_np = (sam3_mask.numpy() > 0.5).astype(np.uint8)
                 else:
                     sam3_np = (sam3_mask > 0.5).astype(np.uint8) if isinstance(sam3_mask, np.ndarray) else np.zeros((H, W), dtype=np.uint8)
+
+                # Build point prompts from SAM3 mask
+                pt_coords, pt_labels = self._sam3_mask_to_points(sam3_np, box, H, W)
+
+                if pt_coords is not None:
+                    masks, scores, _ = zim_predictor.predict(
+                        point_coords=pt_coords, point_labels=pt_labels,
+                        box=bbox_np, multimask_output=False,
+                    )
+                else:
+                    masks, scores, _ = zim_predictor.predict(box=bbox_np, multimask_output=False)
+
+                zim_alpha = masks[0].astype(np.float32)
 
                 obj_coverage = (zim_alpha * sam3_np).sum() / max(sam3_np.sum(), 1)
                 if obj_coverage < ZIM_MIN_COVERAGE:
@@ -460,16 +435,33 @@ class SAM3Gemstone:
                     box[2].item() - x1, box[3].item() - y1,
                 ], dtype=np.float32)
 
-                masks, scores, _ = zim_predictor.predict(box=local_box, multimask_output=False)
-
-                full_zim = np.zeros((H, W), dtype=np.float32)
-                full_zim[y1:y2, x1:x2] = masks[0].astype(np.float32)
-
                 sam3_mask = all_logits[gi]
                 if isinstance(sam3_mask, torch.Tensor):
                     sam3_np = (sam3_mask.numpy() > 0.5).astype(np.uint8)
                 else:
                     sam3_np = np.zeros((H, W), dtype=np.uint8)
+
+                # Build point prompts in crop-local coordinates
+                local_sam3 = sam3_np[y1:y2, x1:x2]
+                crop_h, crop_w = y2 - y1, x2 - x1
+                # Shift box to local coords for point generation
+                local_box_for_pts = torch.tensor([
+                    box[0].item() - x1, box[1].item() - y1,
+                    box[2].item() - x1, box[3].item() - y1,
+                ])
+                pt_coords, pt_labels = self._sam3_mask_to_points(
+                    local_sam3, local_box_for_pts, crop_h, crop_w)
+
+                if pt_coords is not None:
+                    masks, scores, _ = zim_predictor.predict(
+                        point_coords=pt_coords, point_labels=pt_labels,
+                        box=local_box, multimask_output=False,
+                    )
+                else:
+                    masks, scores, _ = zim_predictor.predict(box=local_box, multimask_output=False)
+
+                full_zim = np.zeros((H, W), dtype=np.float32)
+                full_zim[y1:y2, x1:x2] = masks[0].astype(np.float32)
 
                 obj_coverage = (full_zim * sam3_np).sum() / max(sam3_np.sum(), 1)
                 if obj_coverage < ZIM_MIN_COVERAGE:
@@ -886,8 +878,8 @@ class SAM3Gemstone:
         if mask_expansion != 0 and unified_mask.sum() > 0:
             unified_mask = self._expand_mask(unified_mask, mask_expansion)
 
-        # Morphological closing
-        if morph_close_size > 0 and unified_mask.sum() > 0:
+        # Morphological closing — only for binary SAM3 masks (ZIM alpha is already smooth)
+        if zim_predictor is None and morph_close_size > 0 and unified_mask.sum() > 0:
             unified_mask = self._morph_close(unified_mask, morph_close_size)
 
         return unified_mask
@@ -935,6 +927,29 @@ class ZIMRefineMask:
     RETURN_NAMES = ("refined_mask", "overlay")
     FUNCTION = "run"
     CATEGORY = "SAM3-Gemstone"
+
+    @staticmethod
+    def _mask_to_points(obj_mask_u8, bx1, by1, bx2, by2, H, W, n_bg=4):
+        """Extract point prompts from binary mask for ZIM.
+        Returns (point_coords Nx2, point_labels N) or (None, None)."""
+        ys, xs = np.where(obj_mask_u8 > 0)
+        if len(ys) == 0:
+            return None, None
+        cx = float(xs.mean())
+        cy = float(ys.mean())
+        margin = 3
+        bg_candidates = [
+            (max(0, bx1 - margin), (by1 + by2) / 2),
+            (min(W - 1, bx2 + margin), (by1 + by2) / 2),
+            ((bx1 + bx2) / 2, max(0, by1 - margin)),
+            ((bx1 + bx2) / 2, min(H - 1, by2 + margin)),
+        ]
+        coords = [[cx, cy]]
+        labels = [1]
+        for bx, by in bg_candidates[:n_bg]:
+            coords.append([bx, by])
+            labels.append(0)
+        return np.array(coords, dtype=np.float32), np.array(labels, dtype=np.int32)
 
     def run(self, image, mask, chain_mode):
         t0 = time.time()
@@ -1015,16 +1030,23 @@ class ZIMRefineMask:
 
                 for idx, (label_id, x1, y1, x2, y2) in enumerate(small_objects):
                     bbox_np = np.array([x1, y1, x2, y2], dtype=np.float32)
-                    masks_out, scores, _ = predictor.predict(box=bbox_np, multimask_output=False)
-                    zim_alpha = masks_out[0].astype(np.float32)
-
                     obj_mask_u8 = (labels == label_id).astype(np.uint8)
+
+                    # Build point prompts from input mask (centroid + bg corners)
+                    pt_coords, pt_labels = self._mask_to_points(obj_mask_u8, x1, y1, x2, y2, H, W)
+                    if pt_coords is not None:
+                        masks_out, scores, _ = predictor.predict(
+                            point_coords=pt_coords, point_labels=pt_labels,
+                            box=bbox_np, multimask_output=False)
+                    else:
+                        masks_out, scores, _ = predictor.predict(box=bbox_np, multimask_output=False)
+                    zim_alpha = masks_out[0].astype(np.float32)
 
                     # Check if ZIM found something meaningful in this object's area
                     obj_coverage = (zim_alpha * obj_mask_u8).sum() / max(obj_mask_u8.sum(), 1)
 
                     if obj_coverage < zim_min_coverage:
-                        # ZIM didn't find it → use original SAM3 mask for this object
+                        # ZIM didn't find it → use original mask for this object
                         zim_fallback += 1
                         unified_alpha = np.maximum(unified_alpha, obj_mask_u8.astype(np.float32))
                         logger.debug("  [ZIM] obj %d: coverage %.1f%% → FALLBACK",
@@ -1056,14 +1078,24 @@ class ZIMRefineMask:
                     predictor.set_image(crop)
 
                     local_box = np.array([x1 - cx1, y1 - cy1, x2 - cx1, y2 - cy1], dtype=np.float32)
-                    masks_out, scores, _ = predictor.predict(box=local_box, multimask_output=False)
+                    obj_mask_u8 = (labels == label_id).astype(np.uint8)
+
+                    # Build point prompts in crop-local coordinates
+                    local_mask = obj_mask_u8[cy1:cy2, cx1:cx2]
+                    crop_h, crop_w = cy2 - cy1, cx2 - cx1
+                    pt_coords, pt_labels = self._mask_to_points(
+                        local_mask, x1 - cx1, y1 - cy1, x2 - cx1, y2 - cy1, crop_h, crop_w)
+                    if pt_coords is not None:
+                        masks_out, scores, _ = predictor.predict(
+                            point_coords=pt_coords, point_labels=pt_labels,
+                            box=local_box, multimask_output=False)
+                    else:
+                        masks_out, scores, _ = predictor.predict(box=local_box, multimask_output=False)
 
                     crop_alpha = masks_out[0].astype(np.float32)
 
                     full_zim_alpha = np.zeros((H, W), dtype=np.float32)
                     full_zim_alpha[cy1:cy2, cx1:cx2] = crop_alpha
-
-                    obj_mask_u8 = (labels == label_id).astype(np.uint8)
 
                     obj_coverage = (full_zim_alpha * obj_mask_u8).sum() / max(obj_mask_u8.sum(), 1)
 

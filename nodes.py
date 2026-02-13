@@ -81,8 +81,9 @@ class SAM3GemstoneModelLoader:
         )
 
         prop = torch.cuda.get_device_properties(device)
+        vram_bytes = getattr(prop, "total_memory", None) or getattr(prop, "total_mem", 0)
         logger.info("GPU: %s  (compute %d.%d, %.1f GB VRAM)",
-                    prop.name, prop.major, prop.minor, prop.total_mem / (1024**3))
+                    prop.name, prop.major, prop.minor, vram_bytes / (1024**3))
 
         cache_key = f"sam3_{precision}_{compile_model}"
         if cache_key in _sam3_cache:

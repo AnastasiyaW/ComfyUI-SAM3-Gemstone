@@ -191,53 +191,34 @@ class SAM3Gemstone:
     optionally refines edges with ZIM, outputs mask + overlay + stats.
     ComfyUI auto-offloads SAM3 when other models need VRAM."""
 
+    # Default prompt lists (editable by user)
+    DEFAULT_FULL_PROMPTS = "\n".join(STONE_PROMPTS)
+    DEFAULT_TILE_PROMPTS = "\n".join(TILE_PROMPTS)
+
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
                 "image": ("IMAGE",),
-                "score_threshold": ("FLOAT", {
-                    "default": 0.10, "min": 0.01, "max": 1.0, "step": 0.01,
-                    "display": "slider",
+                "full_image_prompts": ("STRING", {
+                    "default": cls.DEFAULT_FULL_PROMPTS,
+                    "multiline": True,
+                    "placeholder": "Prompts for full-image pass (one per line)",
+                    "tooltip": "All prompts run on full image. Default: 22 gem types + cut shapes.",
                 }),
-                "nms_iou_threshold": ("FLOAT", {
-                    "default": 0.50, "min": 0.10, "max": 0.95, "step": 0.05,
-                    "display": "slider",
-                }),
-                "min_solidity": ("FLOAT", {
-                    "default": 0.30, "min": 0.0, "max": 1.0, "step": 0.05,
-                    "display": "slider",
-                }),
-                "min_area_pct": ("FLOAT", {
-                    "default": 0.005, "min": 0.0, "max": 5.0, "step": 0.005,
-                }),
-                "max_area_pct": ("FLOAT", {
-                    "default": 15.0, "min": 1.0, "max": 100.0, "step": 1.0,
-                }),
-                "max_detections": ("INT", {
-                    "default": 128, "min": 1, "max": 512, "step": 1,
-                }),
-                "mask_expansion": ("INT", {
-                    "default": 0, "min": -50, "max": 50, "step": 1,
-                }),
-                "enable_sahi": ("BOOLEAN", {
-                    "default": True,
-                    "tooltip": "Add SAHI tiling pass with tile_prompts on top of full-frame pass",
+                "tile_prompts": ("STRING", {
+                    "default": cls.DEFAULT_TILE_PROMPTS,
+                    "multiline": True,
+                    "placeholder": "Prompts for SAHI tile pass (one per line)",
+                    "tooltip": "Subset of prompts for tiles (speed). Default: diamond + gemstone.",
                 }),
                 "sahi_tile_size": ("INT", {
                     "default": 512, "min": 256, "max": 2048, "step": 128,
-                }),
-                "sahi_overlap": ("FLOAT", {
-                    "default": 0.3, "min": 0.1, "max": 0.5, "step": 0.05,
-                }),
-                "morph_close_size": ("INT", {
-                    "default": 3, "min": 0, "max": 15, "step": 2,
                 }),
                 "use_zim_refinement": ("BOOLEAN", {
                     "default": True,
                     "tooltip": "Refine each detection's edges with ZIM (pixel-perfect alpha matting)",
                 }),
-                "compile_model": ("BOOLEAN", {"default": False}),
             },
         }
 
@@ -617,21 +598,25 @@ class SAM3Gemstone:
     def run(
         self,
         image: torch.Tensor,
-        score_threshold: float,
-        nms_iou_threshold: float,
-        min_solidity: float,
-        min_area_pct: float,
-        max_area_pct: float,
-        max_detections: int,
-        mask_expansion: int,
-        enable_sahi: bool,
+        full_image_prompts: str,
+        tile_prompts: str,
         sahi_tile_size: int,
-        sahi_overlap: float,
-        morph_close_size: int,
         use_zim_refinement: bool,
-        compile_model: bool,
     ):
         t0 = time.time()
+
+        # Hardcoded sensible defaults
+        score_threshold = 0.10
+        nms_iou_threshold = 0.50
+        min_solidity = 0.30
+        min_area_pct = 0.005
+        max_area_pct = 15.0
+        max_detections = 128
+        mask_expansion = 0
+        enable_sahi = True
+        sahi_overlap = 0.3
+        morph_close_size = 3
+        compile_model = False
 
         # --- Load / get cached model + processor ---
         pipe = self._load_model(compile_model)
@@ -660,10 +645,15 @@ class SAM3Gemstone:
         logger.info("Image shape: %s  dtype: %s", image.shape, image.dtype)
         logger.info("=" * 60)
 
-        # Always use built-in 22 stone prompts (full-frame) + 2 tile prompts (SAHI)
-        prompts = STONE_PROMPTS
-        tile_prompts = TILE_PROMPTS
-        logger.info("Using STONE_PROMPTS (%d) + TILE_PROMPTS (%d)", len(prompts), len(tile_prompts))
+        # Parse user-editable prompts
+        prompts = [p.strip() for p in full_image_prompts.strip().splitlines() if p.strip()]
+        t_prompts = [p.strip() for p in tile_prompts.strip().splitlines() if p.strip()]
+        if not prompts:
+            prompts = STONE_PROMPTS
+        if not t_prompts:
+            t_prompts = TILE_PROMPTS
+        tile_prompts = t_prompts
+        logger.info("Full-image prompts (%d), Tile prompts (%d)", len(prompts), len(tile_prompts))
 
         B, H, W, C = image.shape
         logger.info("Batch=%d  H=%d  W=%d", B, H, W)

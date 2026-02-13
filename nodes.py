@@ -233,7 +233,10 @@ class SAM3Gemstone:
                 "morph_close_size": ("INT", {
                     "default": 3, "min": 0, "max": 15, "step": 2,
                 }),
-                "use_zim_refinement": ("BOOLEAN", {"default": False}),
+                "use_zim_refinement": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Refine each detection's edges with ZIM (pixel-perfect alpha matting)",
+                }),
                 "compile_model": ("BOOLEAN", {"default": False}),
             },
         }
@@ -758,7 +761,7 @@ class SAM3Gemstone:
         del state
 
         # SAHI tiling
-        if need_sahi:
+        if enable_sahi:
             tiles = self._get_tiles(H, W, sahi_tile_size, sahi_overlap)
             logger.info("[SAHI] %d tiles (%dx%d, overlap=%.1f), tile_prompts=%d: %s",
                         len(tiles), sahi_tile_size, sahi_tile_size, sahi_overlap,

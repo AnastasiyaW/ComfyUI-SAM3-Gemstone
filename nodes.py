@@ -341,6 +341,14 @@ class SAM3GemstoneSegmentation:
 
         # Build processor with LOW threshold — we filter ourselves
         from sam3.model.sam3_image_processor import Sam3Processor
+
+        # Sam3Processor feeds float32 images into backbone.
+        # Model must be in float32 for compatibility (SAM3 was designed for fp32).
+        # The checkpoint is 3.3GB → ~6.4GB fp32 in VRAM, fine for H100.
+        if dtype != torch.float32:
+            logger.info("Casting model to float32 for Sam3Processor compatibility (was %s)", dtype)
+            model.float()
+
         processor = Sam3Processor(model, confidence_threshold=0.01)
 
         model.to(device)

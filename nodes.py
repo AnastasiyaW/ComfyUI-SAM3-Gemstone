@@ -1296,12 +1296,17 @@ class GemstoneInpaintStitch:
 
             result = original_image.clone()
 
+        # Match batch size if crop has fewer batches (e.g. B=1 vs original B>1)
+        if crop.shape[0] < B:
+            crop = crop.expand(B, -1, -1, -1)
+
         # Fix channel count mismatch
         if crop.shape[3] != C:
             if crop.shape[3] > C:
                 crop = crop[:, :, :, :C]
             else:
-                pad_ch = torch.ones(B, bh, bw, C - crop.shape[3],
+                pad_ch = torch.ones(crop.shape[0], crop.shape[1], crop.shape[2],
+                                    C - crop.shape[3],
                                     dtype=crop.dtype, device=crop.device)
                 crop = torch.cat([crop, pad_ch], dim=3)
 

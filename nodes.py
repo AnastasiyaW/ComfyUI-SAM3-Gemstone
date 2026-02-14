@@ -1131,15 +1131,17 @@ class GemstoneInpaintCrop:
             mask_2d = mask
 
         if mask_2d.shape[0] != H or mask_2d.shape[1] != W:
+            # Use nearest interpolation to avoid bilinear bleed artifacts
             mask_2d = torch.nn.functional.interpolate(
                 mask_2d.unsqueeze(0).unsqueeze(0).float(),
-                size=(H, W), mode="bilinear", align_corners=False,
+                size=(H, W), mode="nearest",
             ).squeeze(0).squeeze(0)
 
         if invert_mask:
             mask_2d = 1.0 - mask_2d
 
-        mask_binary = (mask_2d > 0.01).float()
+        # Threshold 0.5 — solid mask content only, not interpolation artifacts
+        mask_binary = (mask_2d > 0.5).float()
         nonzero = torch.nonzero(mask_binary, as_tuple=False)
 
         if nonzero.shape[0] == 0:
@@ -1326,14 +1328,15 @@ class SimpleGemstoneCrop:
         else:
             mask_2d = mask
 
-        # Resize mask to image dims if needed
+        # Resize mask to image dims if needed (nearest to avoid bleed)
         if mask_2d.shape[0] != H or mask_2d.shape[1] != W:
             mask_2d = torch.nn.functional.interpolate(
                 mask_2d.unsqueeze(0).unsqueeze(0).float(),
-                size=(H, W), mode="bilinear", align_corners=False,
+                size=(H, W), mode="nearest",
             ).squeeze(0).squeeze(0)
 
-        mask_binary = (mask_2d > 0.01).float()
+        # Threshold 0.5 — solid mask content only
+        mask_binary = (mask_2d > 0.5).float()
         nonzero = torch.nonzero(mask_binary, as_tuple=False)
 
         if nonzero.shape[0] == 0:

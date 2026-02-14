@@ -176,7 +176,7 @@ class SAM3Gemstone:
     RETURN_TYPES = ("IMAGE", "MASK", "IMAGE", "STRING", "INT", "FLOAT")
     RETURN_NAMES = ("overlay", "mask", "cropped", "stats_text", "gem_count", "coverage_pct")
     FUNCTION = "run"
-    CATEGORY = "SAM3-Gemstone"
+    CATEGORY = "HappyIn 🔮 SAM3"
     OUTPUT_NODE = True
 
     # =====================================================================
@@ -434,7 +434,6 @@ class SAM3Gemstone:
         score_threshold: float = 0.10,
         nms_iou_threshold: float = 0.50,
         max_detections: int = 256,
-        use_zim_refinement: bool = False,  # backward compat — ignored
     ):
         t0 = time.time()
 
@@ -708,8 +707,6 @@ class SAM3Gemstone:
 
                 # SAM3 grounding masks may be inverted (background=high, object=low).
                 # Check first mask: if mean > 0.5 in bbox region, invert all masks.
-                if not _logged_shape:  # already True, so this won't run
-                    pass
                 if idx_val == surviving_indices[0]:
                     box_check = all_boxes[idx_val]
                     bc_x1 = max(0, int(box_check[0].item()) - tx1)
@@ -823,7 +820,7 @@ class ZIMRefineMask:
     RETURN_TYPES = ("MASK", "IMAGE")
     RETURN_NAMES = ("refined_mask", "overlay")
     FUNCTION = "run"
-    CATEGORY = "SAM3-Gemstone"
+    CATEGORY = "HappyIn 🔮 SAM3"
 
     @staticmethod
     def _split_large_blob(blob_mask: np.ndarray, min_area: int, max_crop: int) -> list:
@@ -1120,7 +1117,7 @@ class GemstoneInpaintCrop:
     RETURN_TYPES = ("IMAGE", "MASK", "IMAGE", "GEMSTONE_BBOX", "STRING")
     RETURN_NAMES = ("cropped_image", "cropped_mask", "masked_composite", "bbox_data", "info")
     FUNCTION = "crop"
-    CATEGORY = "SAM3-Gemstone"
+    CATEGORY = "HappyIn 🔮 SAM3"
 
     def crop(self, image, mask, padding, invert_mask):
         t0 = time.time()
@@ -1155,15 +1152,16 @@ class GemstoneInpaintCrop:
             x_min = nonzero[:, 1].min().item()
             x_max = nonzero[:, 1].max().item()
 
-            y_min = max(0, y_min - padding)
-            y_max = min(H - 1, y_max + padding)
-            x_min = max(0, x_min - padding)
-            x_max = min(W - 1, x_max + padding)
+            # Safe padding: only pad as much as space allows on each side
+            pad_top = min(padding, y_min)
+            pad_bottom = min(padding, H - 1 - y_max)
+            pad_left = min(padding, x_min)
+            pad_right = min(padding, W - 1 - x_max)
 
-            bbox_x = x_min
-            bbox_y = y_min
-            bbox_w = x_max - x_min + 1
-            bbox_h = y_max - y_min + 1
+            bbox_x = x_min - pad_left
+            bbox_y = y_min - pad_top
+            bbox_w = (x_max + 1 + pad_right) - bbox_x
+            bbox_h = (y_max + 1 + pad_bottom) - bbox_y
 
         logger.info("[InpaintCrop] BBox: (%d,%d) %dx%d  padding=%d  image=%dx%d",
                     bbox_x, bbox_y, bbox_w, bbox_h, padding, W, H)
@@ -1222,7 +1220,7 @@ class GemstoneInpaintStitch:
     RETURN_TYPES = ("IMAGE",)
     RETURN_NAMES = ("result",)
     FUNCTION = "stitch"
-    CATEGORY = "SAM3-Gemstone"
+    CATEGORY = "HappyIn 🔮 SAM3"
 
     def stitch(self, original_image, processed_crop, bbox_data, blend_mode, feather_radius, blend_mask=None):
         t0 = time.time()
@@ -1289,6 +1287,100 @@ class GemstoneInpaintStitch:
 
 
 # ============================================================================
+#  Simple Gemstone Crop — trim image to mask bounds with safe padding
+# ============================================================================
+class SimpleGemstoneCrop:
+    """Crop image to the bounding box of the mask region.
+    Trims empty edges so only the area with content remains.
+    Padding is safe: if there's no room to pad, it just doesn't pad
+    (no mirror/wrap/fill tricks). Returns cropped image + mask."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "image": ("IMAGE",),
+                "mask": ("MASK",),
+                "padding": ("INT", {
+                    "default": 16, "min": 0, "max": 500, "step": 1,
+                    "tooltip": "Extra pixels around mask bounds. Safe: if no room, "
+                               "padding is reduced to whatever space is available.",
+                }),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE", "MASK", "STRING")
+    RETURN_NAMES = ("cropped_image", "cropped_mask", "info")
+    FUNCTION = "crop"
+    CATEGORY = "HappyIn 🔮 SAM3"
+
+    def crop(self, image, mask, padding):
+        t0 = time.time()
+        B, H, W, C = image.shape
+
+        # Normalize mask to 2D
+        if mask.ndim == 4:
+            mask_2d = mask[0, :, :, 0]
+        elif mask.ndim == 3:
+            mask_2d = mask[0]
+        else:
+            mask_2d = mask
+
+        # Resize mask to image dims if needed
+        if mask_2d.shape[0] != H or mask_2d.shape[1] != W:
+            mask_2d = torch.nn.functional.interpolate(
+                mask_2d.unsqueeze(0).unsqueeze(0).float(),
+                size=(H, W), mode="bilinear", align_corners=False,
+            ).squeeze(0).squeeze(0)
+
+        mask_binary = (mask_2d > 0.01).float()
+        nonzero = torch.nonzero(mask_binary, as_tuple=False)
+
+        if nonzero.shape[0] == 0:
+            logger.info("[SimpleCrop] Empty mask — returning full image")
+            info = f"Empty mask — no crop | {W}x{H}"
+            mask_out = mask_2d.unsqueeze(0) if B == 1 else mask_2d.unsqueeze(0).expand(B, -1, -1)
+            return (image, mask_out, info)
+
+        y_min = nonzero[:, 0].min().item()
+        y_max = nonzero[:, 0].max().item()
+        x_min = nonzero[:, 1].min().item()
+        x_max = nonzero[:, 1].max().item()
+
+        # Safe padding: clamp to available space on each side
+        pad_top = min(padding, y_min)
+        pad_bottom = min(padding, H - 1 - y_max)
+        pad_left = min(padding, x_min)
+        pad_right = min(padding, W - 1 - x_max)
+
+        cy1 = y_min - pad_top
+        cy2 = y_max + 1 + pad_bottom
+        cx1 = x_min - pad_left
+        cx2 = x_max + 1 + pad_right
+
+        logger.info("[SimpleCrop] Mask bounds: (%d,%d)-(%d,%d) | Pad applied: T=%d B=%d L=%d R=%d | "
+                    "Crop: %dx%d from %dx%d",
+                    x_min, y_min, x_max, y_max,
+                    pad_top, pad_bottom, pad_left, pad_right,
+                    cx2 - cx1, cy2 - cy1, W, H)
+
+        cropped_image = image[:, cy1:cy2, cx1:cx2, :]
+        cropped_mask_2d = mask_2d[cy1:cy2, cx1:cx2]
+
+        if B > 1:
+            cropped_mask = cropped_mask_2d.unsqueeze(0).expand(B, -1, -1)
+        else:
+            cropped_mask = cropped_mask_2d.unsqueeze(0)
+
+        crop_w, crop_h = cx2 - cx1, cy2 - cy1
+        info = (f"Crop: {crop_w}x{crop_h} at ({cx1},{cy1}) | Orig: {W}x{H} | "
+                f"Pad: T={pad_top} B={pad_bottom} L={pad_left} R={pad_right}")
+
+        logger.info("[SimpleCrop] Done in %.2fs", time.time() - t0)
+        return (cropped_image, cropped_mask, info)
+
+
+# ============================================================================
 #  MAPPINGS
 # ============================================================================
 NODE_CLASS_MAPPINGS = {
@@ -1296,11 +1388,13 @@ NODE_CLASS_MAPPINGS = {
     "ZIMRefineMask": ZIMRefineMask,
     "GemstoneInpaintCrop": GemstoneInpaintCrop,
     "GemstoneInpaintStitch": GemstoneInpaintStitch,
+    "SimpleGemstoneCrop": SimpleGemstoneCrop,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "SAM3Gemstone": "SAM3 Gemstone",
-    "ZIMRefineMask": "ZIM Refine Mask",
-    "GemstoneInpaintCrop": "Gemstone Inpaint Crop",
-    "GemstoneInpaintStitch": "Gemstone Inpaint Stitch",
+    "SAM3Gemstone": "HappyIn 🔮 SAM3 Gemstone",
+    "ZIMRefineMask": "HappyIn 🔮 SAM3 ZIM Refine Mask",
+    "GemstoneInpaintCrop": "HappyIn 🔮 SAM3 Inpaint Crop",
+    "GemstoneInpaintStitch": "HappyIn 🔮 SAM3 Inpaint Stitch",
+    "SimpleGemstoneCrop": "HappyIn 🔮 SAM3 Simple Crop",
 }

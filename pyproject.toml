@@ -6,7 +6,7 @@ license = "MIT"
 requires-python = ">=3.12"
 
 [project.urls]
-Repository = "https://github.com/BOBsonic459/ComfyUI-SAM3-Gemstone"
+Repository = "https://github.com/AnastasiyaW/ComfyUI-SAM3-Gemstone"
 
 [tool.comfy]
 PublisherId = "bobsonic459"

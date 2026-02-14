@@ -1886,8 +1886,8 @@ NODE_CLASS_MAPPINGS = {
 NODE_DISPLAY_NAME_MAPPINGS = {
     "SAM3Gemstone": "🔮 HappyIn SAM3 Gemstone",
     "SAM3Boolean": "🔮 HappyIn SAM3 Boolean Switch",
-    "MaskPositive": "🔮 HappyIn Mask Positive (Add Missing)",
-    "MaskNegative": "🔮 HappyIn Mask Negative (Cut Holes)",
+    "MaskPositive": "🔮 HappyIn Mask Donor Positive (Add Missing)",
+    "MaskNegative": "🔮 HappyIn Mask Donor Negative (Cut Holes)",
     "GemstoneInpaintCrop": "🔮 HappyIn SAM3 Inpaint Crop",
     "GemstoneInpaintStitch": "🔮 HappyIn SAM3 Inpaint Stitch",
     "SimpleGemstoneCrop": "🔮 HappyIn SAM3 Simple Crop",

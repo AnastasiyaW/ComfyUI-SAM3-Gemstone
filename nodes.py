@@ -176,7 +176,7 @@ class SAM3Gemstone:
     RETURN_TYPES = ("IMAGE", "MASK", "IMAGE", "STRING", "INT", "FLOAT")
     RETURN_NAMES = ("overlay", "mask", "cropped", "stats_text", "gem_count", "coverage_pct")
     FUNCTION = "run"
-    CATEGORY = "HappyIn 🔮 SAM3"
+    CATEGORY = "🔮 HappyIn SAM3"
     OUTPUT_NODE = True
 
     # =====================================================================
@@ -820,7 +820,7 @@ class ZIMRefineMask:
     RETURN_TYPES = ("MASK", "IMAGE")
     RETURN_NAMES = ("refined_mask", "overlay")
     FUNCTION = "run"
-    CATEGORY = "HappyIn 🔮 SAM3"
+    CATEGORY = "🔮 HappyIn SAM3"
 
     @staticmethod
     def _split_large_blob(blob_mask: np.ndarray, min_area: int, max_crop: int) -> list:
@@ -1117,7 +1117,7 @@ class GemstoneInpaintCrop:
     RETURN_TYPES = ("IMAGE", "MASK", "IMAGE", "GEMSTONE_BBOX", "STRING")
     RETURN_NAMES = ("cropped_image", "cropped_mask", "masked_composite", "bbox_data", "info")
     FUNCTION = "crop"
-    CATEGORY = "HappyIn 🔮 SAM3"
+    CATEGORY = "🔮 HappyIn SAM3"
 
     def crop(self, image, mask, padding, invert_mask):
         t0 = time.time()
@@ -1220,7 +1220,7 @@ class GemstoneInpaintStitch:
     RETURN_TYPES = ("IMAGE",)
     RETURN_NAMES = ("result",)
     FUNCTION = "stitch"
-    CATEGORY = "HappyIn 🔮 SAM3"
+    CATEGORY = "🔮 HappyIn SAM3"
 
     def stitch(self, original_image, processed_crop, bbox_data, blend_mode, feather_radius, blend_mask=None):
         t0 = time.time()
@@ -1312,7 +1312,7 @@ class SimpleGemstoneCrop:
     RETURN_TYPES = ("IMAGE", "MASK", "STRING")
     RETURN_NAMES = ("cropped_image", "cropped_mask", "info")
     FUNCTION = "crop"
-    CATEGORY = "HappyIn 🔮 SAM3"
+    CATEGORY = "🔮 HappyIn SAM3"
 
     def crop(self, image, mask, padding):
         t0 = time.time()
@@ -1392,9 +1392,9 @@ NODE_CLASS_MAPPINGS = {
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "SAM3Gemstone": "HappyIn 🔮 SAM3 Gemstone",
-    "ZIMRefineMask": "HappyIn 🔮 SAM3 ZIM Refine Mask",
-    "GemstoneInpaintCrop": "HappyIn 🔮 SAM3 Inpaint Crop",
-    "GemstoneInpaintStitch": "HappyIn 🔮 SAM3 Inpaint Stitch",
-    "SimpleGemstoneCrop": "HappyIn 🔮 SAM3 Simple Crop",
+    "SAM3Gemstone": "🔮 HappyIn SAM3 Gemstone",
+    "ZIMRefineMask": "🔮 HappyIn SAM3 ZIM Refine Mask",
+    "GemstoneInpaintCrop": "🔮 HappyIn SAM3 Inpaint Crop",
+    "GemstoneInpaintStitch": "🔮 HappyIn SAM3 Inpaint Stitch",
+    "SimpleGemstoneCrop": "🔮 HappyIn SAM3 Simple Crop",
 }

@@ -1199,7 +1199,15 @@ class GemstoneInpaintCrop:
 # ============================================================================
 class GemstoneInpaintStitch:
     """Paste processed crop back into original image using bbox_data from GemstoneInpaintCrop.
-    Supports hard replace or feathered blend."""
+
+    Two resize modes when the crop changed size (e.g. after upscale/inpaint):
+      fit_to_bbox  — shrink/stretch the crop to fit the original bbox region,
+                     original image stays the same size.
+      resize_canvas — scale the ENTIRE original image up so the bbox region
+                      matches the crop size, then paste 1:1 (no quality loss
+                      on the processed area).
+
+    Blend modes: replace (hard paste) or feather (soft edges)."""
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -1208,6 +1216,11 @@ class GemstoneInpaintStitch:
                 "original_image": ("IMAGE",),
                 "processed_crop": ("IMAGE",),
                 "bbox_data": ("GEMSTONE_BBOX",),
+                "resize_mode": (["fit_to_bbox", "resize_canvas"], {
+                    "default": "fit_to_bbox",
+                    "tooltip": "fit_to_bbox = scale crop to bbox size (original stays same). "
+                               "resize_canvas = scale original up so crop fits 1:1.",
+                }),
                 "blend_mode": (["replace", "feather"], {"default": "replace"}),
                 "feather_radius": ("INT", {
                     "default": 8, "min": 0, "max": 100, "step": 1,
@@ -1224,7 +1237,8 @@ class GemstoneInpaintStitch:
     FUNCTION = "stitch"
     CATEGORY = "🔮 HappyIn SAM3"
 
-    def stitch(self, original_image, processed_crop, bbox_data, blend_mode, feather_radius, blend_mask=None):
+    def stitch(self, original_image, processed_crop, bbox_data, resize_mode,
+               blend_mode, feather_radius, blend_mask=None):
         t0 = time.time()
         B, H, W, C = original_image.shape
         bx = bbox_data["x"]
@@ -1232,27 +1246,76 @@ class GemstoneInpaintStitch:
         bw = bbox_data["width"]
         bh = bbox_data["height"]
 
-        logger.info("[InpaintStitch] Pasting %dx%d at (%d,%d) mode=%s", bw, bh, bx, by, blend_mode)
-
         crop = processed_crop
-        if crop.shape[1] != bh or crop.shape[2] != bw:
-            crop = torch.nn.functional.interpolate(
-                crop.permute(0, 3, 1, 2).float(),
-                size=(bh, bw), mode="bilinear", align_corners=False,
+        crop_h, crop_w = crop.shape[1], crop.shape[2]
+
+        logger.info("[InpaintStitch] bbox=(%d,%d) %dx%d | crop=%dx%d | mode=%s/%s",
+                    bx, by, bw, bh, crop_w, crop_h, resize_mode, blend_mode)
+
+        # --- Decide how to handle size mismatch ---
+        if resize_mode == "resize_canvas" and (crop_h != bh or crop_w != bw):
+            # Scale the entire original image so the bbox region matches crop size
+            scale_y = crop_h / bh
+            scale_x = crop_w / bw
+            # Use the larger scale to ensure crop fits
+            scale = max(scale_x, scale_y)
+            new_H = int(round(H * scale))
+            new_W = int(round(W * scale))
+
+            logger.info("[InpaintStitch] resize_canvas: scale=%.3f, original %dx%d → %dx%d",
+                        scale, W, H, new_W, new_H)
+
+            # Upscale original image
+            result = torch.nn.functional.interpolate(
+                original_image.permute(0, 3, 1, 2).float(),
+                size=(new_H, new_W), mode="bilinear", align_corners=False,
             ).permute(0, 2, 3, 1)
 
+            # Recalculate bbox position in the scaled image
+            bx = int(round(bx * scale))
+            by = int(round(by * scale))
+            bw = int(round(bw * scale))
+            bh = int(round(bh * scale))
+            H, W = new_H, new_W
+
+            # Now scale crop to the new bbox size (should be very close, just rounding)
+            if crop.shape[1] != bh or crop.shape[2] != bw:
+                crop = torch.nn.functional.interpolate(
+                    crop.permute(0, 3, 1, 2).float(),
+                    size=(bh, bw), mode="bilinear", align_corners=False,
+                ).permute(0, 2, 3, 1)
+        else:
+            # fit_to_bbox: scale crop down/up to match bbox size
+            if crop.shape[1] != bh or crop.shape[2] != bw:
+                logger.info("[InpaintStitch] fit_to_bbox: resizing crop %dx%d → %dx%d",
+                            crop_w, crop_h, bw, bh)
+                crop = torch.nn.functional.interpolate(
+                    crop.permute(0, 3, 1, 2).float(),
+                    size=(bh, bw), mode="bilinear", align_corners=False,
+                ).permute(0, 2, 3, 1)
+
+            result = original_image.clone()
+
+        # Fix channel count mismatch
         if crop.shape[3] != C:
             if crop.shape[3] > C:
                 crop = crop[:, :, :, :C]
             else:
-                pad = torch.ones(B, bh, bw, C - crop.shape[3], dtype=crop.dtype, device=crop.device)
-                crop = torch.cat([crop, pad], dim=3)
+                pad_ch = torch.ones(B, bh, bw, C - crop.shape[3],
+                                    dtype=crop.dtype, device=crop.device)
+                crop = torch.cat([crop, pad_ch], dim=3)
 
-        result = original_image.clone()
+        # --- Clamp bbox to image bounds (safety) ---
+        paste_y2 = min(by + bh, H)
+        paste_x2 = min(bx + bw, W)
+        paste_h = paste_y2 - by
+        paste_w = paste_x2 - bx
 
+        # --- Paste ---
         if blend_mode == "replace":
-            result[:, by:by + bh, bx:bx + bw, :] = crop
+            result[:, by:paste_y2, bx:paste_x2, :] = crop[:, :paste_h, :paste_w, :]
         else:
+            # Build alpha mask for feathering
             if blend_mask is not None:
                 if blend_mask.ndim == 3:
                     alpha = blend_mask[0]
@@ -1261,8 +1324,6 @@ class GemstoneInpaintStitch:
                 else:
                     alpha = blend_mask
                 if alpha.shape[0] != bh or alpha.shape[1] != bw:
-                    logger.info("[InpaintStitch] Resizing blend_mask from %dx%d to %dx%d",
-                                alpha.shape[1], alpha.shape[0], bw, bh)
                     alpha = torch.nn.functional.interpolate(
                         alpha.unsqueeze(0).unsqueeze(0).float(),
                         size=(bh, bw), mode="bilinear", align_corners=False,
@@ -1271,20 +1332,21 @@ class GemstoneInpaintStitch:
                 alpha = torch.ones(bh, bw, dtype=torch.float32)
                 if feather_radius > 0:
                     alpha_np = (alpha.numpy() * 255).astype(np.uint8)
-                    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
-                                                       (feather_radius * 2 + 1, feather_radius * 2 + 1))
+                    k_size = feather_radius * 2 + 1
+                    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_size, k_size))
                     eroded = cv2.erode(alpha_np, kernel, iterations=1)
-                    blurred = cv2.GaussianBlur(eroded, (feather_radius * 2 + 1, feather_radius * 2 + 1), 0)
+                    blurred = cv2.GaussianBlur(eroded, (k_size, k_size), 0)
                     alpha = torch.from_numpy(blurred.astype(np.float32) / 255.0)
 
-            alpha_3d = alpha.unsqueeze(-1)
+            alpha_3d = alpha[:paste_h, :paste_w].unsqueeze(-1)
             for b in range(B):
-                orig_region = result[b, by:by + bh, bx:bx + bw, :]
-                result[b, by:by + bh, bx:bx + bw, :] = (
-                    orig_region * (1 - alpha_3d) + crop[b] * alpha_3d
+                orig_region = result[b, by:paste_y2, bx:paste_x2, :]
+                result[b, by:paste_y2, bx:paste_x2, :] = (
+                    orig_region * (1 - alpha_3d) + crop[b, :paste_h, :paste_w, :] * alpha_3d
                 )
 
-        logger.info("[InpaintStitch] Done in %.2fs", time.time() - t0)
+        logger.info("[InpaintStitch] Result: %dx%d  Done in %.2fs",
+                    result.shape[2], result.shape[1], time.time() - t0)
         return (result,)
 
 

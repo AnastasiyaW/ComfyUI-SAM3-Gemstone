@@ -1502,11 +1502,191 @@ class SimpleGemstoneCrop:
 
 
 # ============================================================================
+#  Mask Donor — restore missing regions from donor mask
+# ============================================================================
+class MaskDonor:
+    """Compare base mask with donor mask and restore missing regions.
+
+    Finds connected components in the donor that are absent (or mostly absent)
+    from the base mask, then adds those regions to produce a repaired mask.
+
+    Use case: SAM3 occasionally misses a stone — the donor mask (from another
+    pass or method) has that stone. This node transplants only the missing
+    pieces while keeping the base mask as the primary source of truth.
+
+    Logic per donor blob:
+      overlap = (donor_blob & base_binary).sum / donor_blob.sum
+      if overlap < overlap_threshold → blob is "missing" → add it from donor
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "base_mask": ("MASK", {
+                    "tooltip": "Primary mask — everything from here is kept as-is.",
+                }),
+                "donor_mask": ("MASK", {
+                    "tooltip": "Donor mask — missing regions are transplanted from here.",
+                }),
+                "overlap_threshold": ("FLOAT", {
+                    "default": 0.30, "min": 0.0, "max": 1.0, "step": 0.05,
+                    "tooltip": "If a donor blob overlaps base by LESS than this ratio, "
+                               "it is considered 'missing' and added. "
+                               "0.0 = add only completely absent blobs; "
+                               "0.5 = add blobs that are less than 50% covered.",
+                }),
+                "min_blob_area": ("INT", {
+                    "default": 100, "min": 1, "max": 100000, "step": 10,
+                    "tooltip": "Ignore donor blobs smaller than this (in pixels). "
+                               "Prevents noise from being transplanted.",
+                }),
+            },
+            "optional": {
+                "search_mask": ("MASK", {
+                    "tooltip": "Optional: limit donor transplant to white region only.",
+                }),
+            },
+        }
+
+    RETURN_TYPES = ("MASK", "MASK", "MASK", "INT", "STRING")
+    RETURN_NAMES = ("repaired_mask", "added_regions", "base_only", "added_count", "info")
+    FUNCTION = "run"
+    CATEGORY = "🔮 HappyIn SAM3"
+
+    def run(self, base_mask: torch.Tensor, donor_mask: torch.Tensor,
+            overlap_threshold: float = 0.30, min_blob_area: int = 100,
+            search_mask: torch.Tensor | None = None):
+        t0 = time.time()
+
+        # Handle batch dimension — use first frame
+        if base_mask.ndim == 3:
+            B = base_mask.shape[0]
+        elif base_mask.ndim == 2:
+            B = 1
+        else:
+            B = base_mask.shape[0]
+
+        # We'll process per-batch
+        all_repaired = []
+        all_added = []
+        all_base_only = []
+        total_added = 0
+        info_lines = []
+
+        for b_idx in range(B):
+            # Extract 2D masks
+            if base_mask.ndim == 2:
+                base_2d = base_mask.float()
+            elif base_mask.ndim == 3:
+                base_2d = base_mask[b_idx].float()
+            else:
+                base_2d = base_mask[b_idx, :, :, 0].float() if base_mask.ndim == 4 else base_mask[0].float()
+
+            if donor_mask.ndim == 2:
+                donor_2d = donor_mask.float()
+            elif donor_mask.ndim == 3:
+                donor_2d = donor_mask[min(b_idx, donor_mask.shape[0] - 1)].float()
+            else:
+                donor_2d = donor_mask[min(b_idx, donor_mask.shape[0] - 1), :, :, 0].float() if donor_mask.ndim == 4 else donor_mask[0].float()
+
+            H, W = base_2d.shape
+
+            # Resize donor if needed
+            if donor_2d.shape[0] != H or donor_2d.shape[1] != W:
+                donor_2d = torch.nn.functional.interpolate(
+                    donor_2d.unsqueeze(0).unsqueeze(0),
+                    size=(H, W), mode="nearest",
+                ).squeeze(0).squeeze(0)
+
+            # Optional search mask
+            search_np = None
+            if search_mask is not None:
+                s2d = _normalize_mask_to_2d(search_mask, H, W)
+                search_np = (s2d > 0.5).cpu().numpy().astype(np.uint8)
+
+            base_np = base_2d.cpu().numpy()
+            donor_np = donor_2d.cpu().numpy()
+
+            base_binary = (base_np > 0.5).astype(np.uint8)
+            donor_binary = (donor_np > 0.5).astype(np.uint8)
+
+            # Apply search mask to donor
+            if search_np is not None:
+                donor_binary = donor_binary & search_np
+
+            # Find connected components in donor
+            num_labels, donor_labels = cv2.connectedComponents(donor_binary, connectivity=8)
+
+            added_mask = np.zeros((H, W), dtype=np.float32)
+            n_added = 0
+            n_skipped_small = 0
+            n_skipped_overlap = 0
+
+            for label_id in range(1, num_labels):
+                blob = (donor_labels == label_id)
+                blob_area = blob.sum()
+
+                if blob_area < min_blob_area:
+                    n_skipped_small += 1
+                    continue
+
+                # Compute overlap with base
+                overlap = (blob & (base_binary > 0)).sum()
+                overlap_ratio = overlap / blob_area if blob_area > 0 else 0.0
+
+                if overlap_ratio < overlap_threshold:
+                    # This blob is missing from base → transplant it
+                    # Use donor's actual values (not just binary) for soft edges
+                    blob_float = blob.astype(np.float32)
+                    donor_values = donor_np * blob_float
+                    added_mask = np.maximum(added_mask, donor_values)
+                    n_added += 1
+                    logger.info("[MaskDonor] Blob %d: area=%d overlap=%.1f%% → ADDED",
+                                label_id, blob_area, overlap_ratio * 100)
+                else:
+                    n_skipped_overlap += 1
+
+            total_added += n_added
+
+            # Build repaired mask: base + added donor regions
+            repaired_np = np.maximum(base_np, added_mask)
+
+            # Clamp to [0, 1]
+            repaired_np = np.clip(repaired_np, 0.0, 1.0)
+            added_mask = np.clip(added_mask, 0.0, 1.0)
+
+            all_repaired.append(torch.from_numpy(repaired_np).float())
+            all_added.append(torch.from_numpy(added_mask).float())
+            all_base_only.append(base_2d.cpu())
+
+            info_line = (f"[Batch {b_idx}] Donor blobs: {num_labels - 1} | "
+                         f"Added: {n_added} | "
+                         f"Skipped (small): {n_skipped_small} | "
+                         f"Skipped (overlap): {n_skipped_overlap}")
+            info_lines.append(info_line)
+            logger.info("[MaskDonor] %s", info_line)
+
+        repaired_batch = torch.stack(all_repaired, dim=0)
+        added_batch = torch.stack(all_added, dim=0)
+        base_only_batch = torch.stack(all_base_only, dim=0)
+
+        info_lines.insert(0, f"=== MaskDonor ({B} images) ===")
+        info_lines.append(f"Total added regions: {total_added}")
+        info_text = "\n".join(info_lines)
+
+        logger.info("[MaskDonor] DONE in %.2fs — added %d regions", time.time() - t0, total_added)
+
+        return (repaired_batch, added_batch, base_only_batch, total_added, info_text)
+
+
+# ============================================================================
 #  MAPPINGS
 # ============================================================================
 NODE_CLASS_MAPPINGS = {
     "SAM3Gemstone": SAM3GemstoneV2,
     "SAM3Boolean": SAM3Boolean,
+    "MaskDonor": MaskDonor,
     "GemstoneInpaintCrop": GemstoneInpaintCrop,
     "GemstoneInpaintStitch": GemstoneInpaintStitch,
     "SimpleGemstoneCrop": SimpleGemstoneCrop,
@@ -1515,6 +1695,7 @@ NODE_CLASS_MAPPINGS = {
 NODE_DISPLAY_NAME_MAPPINGS = {
     "SAM3Gemstone": "🔮 HappyIn SAM3 Gemstone",
     "SAM3Boolean": "🔮 HappyIn SAM3 Boolean Switch",
+    "MaskDonor": "🔮 HappyIn Mask Donor (Repair Missing)",
     "GemstoneInpaintCrop": "🔮 HappyIn SAM3 Inpaint Crop",
     "GemstoneInpaintStitch": "🔮 HappyIn SAM3 Inpaint Stitch",
     "SimpleGemstoneCrop": "🔮 HappyIn SAM3 Simple Crop",

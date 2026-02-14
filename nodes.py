@@ -1681,12 +1681,203 @@ class MaskDonor:
 
 
 # ============================================================================
+#  Hole Donor — transplant holes from reference mask into base
+# ============================================================================
+class HoleDonor:
+    """Compare base mask with reference mask and cut holes that exist in
+    reference but are absent from base.
+
+    Inverse of MaskDonor: instead of adding missing WHITE blobs, this node
+    adds missing BLACK holes (gaps inside the mask).
+
+    How it works:
+      1. Invert both masks → holes become blobs.
+      2. Find connected components of inverted reference (= holes in reference).
+      3. For each hole-blob: check overlap with inverted base.
+         If the hole is mostly ABSENT from base → cut it from base.
+
+    Use case: reference mask has proper cutouts between stones (chain gaps,
+    mounting holes) that the base mask filled in by mistake. This node
+    transplants those holes into the base.
+
+    Logic per reference hole:
+      overlap = (ref_hole & base_hole).sum / ref_hole.sum
+      if overlap < overlap_threshold → hole is missing in base → cut it out
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "base_mask": ("MASK", {
+                    "tooltip": "Primary mask — holes will be cut INTO this mask.",
+                }),
+                "reference_mask": ("MASK", {
+                    "tooltip": "Reference mask — holes are taken FROM this mask.",
+                }),
+                "overlap_threshold": ("FLOAT", {
+                    "default": 0.30, "min": 0.0, "max": 1.0, "step": 0.05,
+                    "tooltip": "If a reference hole overlaps base holes by LESS than "
+                               "this ratio, it is considered 'missing' and cut out. "
+                               "0.0 = cut only completely absent holes; "
+                               "0.5 = cut holes that are less than 50% present.",
+                }),
+                "min_hole_area": ("INT", {
+                    "default": 100, "min": 1, "max": 100000, "step": 10,
+                    "tooltip": "Ignore reference holes smaller than this (pixels). "
+                               "Prevents noise artifacts.",
+                }),
+            },
+            "optional": {
+                "search_mask": ("MASK", {
+                    "tooltip": "Optional: only consider holes within the white region.",
+                }),
+            },
+        }
+
+    RETURN_TYPES = ("MASK", "MASK", "MASK", "INT", "STRING")
+    RETURN_NAMES = ("repaired_mask", "cut_holes", "base_only", "holes_count", "info")
+    FUNCTION = "run"
+    CATEGORY = "🔮 HappyIn SAM3"
+
+    def run(self, base_mask: torch.Tensor, reference_mask: torch.Tensor,
+            overlap_threshold: float = 0.30, min_hole_area: int = 100,
+            search_mask: torch.Tensor | None = None):
+        t0 = time.time()
+
+        if base_mask.ndim == 3:
+            B = base_mask.shape[0]
+        elif base_mask.ndim == 2:
+            B = 1
+        else:
+            B = base_mask.shape[0]
+
+        all_repaired = []
+        all_holes = []
+        all_base_only = []
+        total_holes = 0
+        info_lines = []
+
+        for b_idx in range(B):
+            # Extract 2D masks
+            if base_mask.ndim == 2:
+                base_2d = base_mask.float()
+            elif base_mask.ndim == 3:
+                base_2d = base_mask[b_idx].float()
+            else:
+                base_2d = base_mask[b_idx, :, :, 0].float() if base_mask.ndim == 4 else base_mask[0].float()
+
+            if reference_mask.ndim == 2:
+                ref_2d = reference_mask.float()
+            elif reference_mask.ndim == 3:
+                ref_2d = reference_mask[min(b_idx, reference_mask.shape[0] - 1)].float()
+            else:
+                ref_2d = reference_mask[min(b_idx, reference_mask.shape[0] - 1), :, :, 0].float() if reference_mask.ndim == 4 else reference_mask[0].float()
+
+            H, W = base_2d.shape
+
+            # Resize reference if needed
+            if ref_2d.shape[0] != H or ref_2d.shape[1] != W:
+                ref_2d = torch.nn.functional.interpolate(
+                    ref_2d.unsqueeze(0).unsqueeze(0),
+                    size=(H, W), mode="nearest",
+                ).squeeze(0).squeeze(0)
+
+            # Optional search mask
+            search_np = None
+            if search_mask is not None:
+                s2d = _normalize_mask_to_2d(search_mask, H, W)
+                search_np = (s2d > 0.5).cpu().numpy().astype(np.uint8)
+
+            base_np = base_2d.cpu().numpy()
+            ref_np = ref_2d.cpu().numpy()
+
+            base_binary = (base_np > 0.5).astype(np.uint8)
+            ref_binary = (ref_np > 0.5).astype(np.uint8)
+
+            # Invert: holes become blobs
+            # We only care about holes INSIDE the mask area, so we look at
+            # the union coverage to define "inside"
+            union_binary = np.maximum(base_binary, ref_binary)
+
+            # Holes in reference = white in union but black in reference
+            ref_holes = union_binary & (1 - ref_binary)
+            # Holes in base = white in union but black in base
+            base_holes = union_binary & (1 - base_binary)
+
+            # Apply search mask
+            if search_np is not None:
+                ref_holes = ref_holes & search_np
+
+            # Find connected components of reference holes
+            num_labels, hole_labels = cv2.connectedComponents(ref_holes, connectivity=8)
+
+            cut_mask = np.zeros((H, W), dtype=np.float32)
+            n_cut = 0
+            n_skipped_small = 0
+            n_skipped_overlap = 0
+
+            for label_id in range(1, num_labels):
+                hole_blob = (hole_labels == label_id)
+                hole_area = hole_blob.sum()
+
+                if hole_area < min_hole_area:
+                    n_skipped_small += 1
+                    continue
+
+                # Check if this hole already exists in base
+                overlap = (hole_blob & (base_holes > 0)).sum()
+                overlap_ratio = overlap / hole_area if hole_area > 0 else 0.0
+
+                if overlap_ratio < overlap_threshold:
+                    # This hole is missing from base → cut it
+                    cut_mask = np.maximum(cut_mask, hole_blob.astype(np.float32))
+                    n_cut += 1
+                    logger.info("[HoleDonor] Hole %d: area=%d overlap=%.1f%% → CUT",
+                                label_id, hole_area, overlap_ratio * 100)
+                else:
+                    n_skipped_overlap += 1
+
+            total_holes += n_cut
+
+            # Apply: subtract holes from base
+            repaired_np = base_np.copy()
+            repaired_np[cut_mask > 0.5] = 0.0
+            repaired_np = np.clip(repaired_np, 0.0, 1.0)
+            cut_mask = np.clip(cut_mask, 0.0, 1.0)
+
+            all_repaired.append(torch.from_numpy(repaired_np).float())
+            all_holes.append(torch.from_numpy(cut_mask).float())
+            all_base_only.append(base_2d.cpu())
+
+            info_line = (f"[Batch {b_idx}] Ref holes: {num_labels - 1} | "
+                         f"Cut: {n_cut} | "
+                         f"Skipped (small): {n_skipped_small} | "
+                         f"Skipped (overlap): {n_skipped_overlap}")
+            info_lines.append(info_line)
+            logger.info("[HoleDonor] %s", info_line)
+
+        repaired_batch = torch.stack(all_repaired, dim=0)
+        holes_batch = torch.stack(all_holes, dim=0)
+        base_only_batch = torch.stack(all_base_only, dim=0)
+
+        info_lines.insert(0, f"=== HoleDonor ({B} images) ===")
+        info_lines.append(f"Total holes cut: {total_holes}")
+        info_text = "\n".join(info_lines)
+
+        logger.info("[HoleDonor] DONE in %.2fs — cut %d holes", time.time() - t0, total_holes)
+
+        return (repaired_batch, holes_batch, base_only_batch, total_holes, info_text)
+
+
+# ============================================================================
 #  MAPPINGS
 # ============================================================================
 NODE_CLASS_MAPPINGS = {
     "SAM3Gemstone": SAM3GemstoneV2,
     "SAM3Boolean": SAM3Boolean,
-    "MaskDonor": MaskDonor,
+    "MaskPositive": MaskDonor,
+    "MaskNegative": HoleDonor,
     "GemstoneInpaintCrop": GemstoneInpaintCrop,
     "GemstoneInpaintStitch": GemstoneInpaintStitch,
     "SimpleGemstoneCrop": SimpleGemstoneCrop,
@@ -1695,7 +1886,8 @@ NODE_CLASS_MAPPINGS = {
 NODE_DISPLAY_NAME_MAPPINGS = {
     "SAM3Gemstone": "🔮 HappyIn SAM3 Gemstone",
     "SAM3Boolean": "🔮 HappyIn SAM3 Boolean Switch",
-    "MaskDonor": "🔮 HappyIn Mask Donor (Repair Missing)",
+    "MaskPositive": "🔮 HappyIn Mask Positive (Add Missing)",
+    "MaskNegative": "🔮 HappyIn Mask Negative (Cut Holes)",
     "GemstoneInpaintCrop": "🔮 HappyIn SAM3 Inpaint Crop",
     "GemstoneInpaintStitch": "🔮 HappyIn SAM3 Inpaint Stitch",
     "SimpleGemstoneCrop": "🔮 HappyIn SAM3 Simple Crop",
